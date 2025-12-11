@@ -1,0 +1,702 @@
+---
+title: "BMDMs + TNF alpha Inflammation Networking Process"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# ======================================================
+# 0) 패키지 로드 & 유틸 (에러 방지: 폰트 폴백, 숫자 강제, NA 안전 처리)
+# ======================================================
+suppressPackageStartupMessages({
+  library(tibble); library(readr); library(readxl)
+  library(dplyr);  library(stringr); library(purrr)
+  library(tidyr);  library(ggplot2)
+  library(igraph); library(ggraph); library(ggrepel); library(scales)
+})
+
+# ----- 안전한 폰트 선택: Times New Roman이 없으면 sans로 폴백
+choose_font <- function(preferred = "Times New Roman", fallback = "sans"){
+  has_sysfonts <- requireNamespace("systemfonts", quietly = TRUE)
+  if (!has_sysfonts) return(fallback)
+  fm <- try(systemfonts::system_fonts(), silent = TRUE)
+  if (inherits(fm, "try-error")) return(fallback)
+  if (any(grepl(sprintf("^%s$", preferred), fm$family, ignore.case = TRUE))) preferred else fallback
+}
+BASE_FONT <- choose_font()
+
+# ----- 안전한 숫자 변환
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+# ----- 디렉토리 보장
+ensuredir <- function(path){
+  dir.create(path, showWarnings = FALSE, recursive = TRUE)
+  path
+}
+
+# ----- 문자열 정규화 키
+norm_key <- function(x) stringr::str_squish(stringr::str_to_lower(x))
+
+# ----- intersections/genes 컬럼 자동 탐지
+detect_intersection_col <- function(df){
+  cand <- tolower(names(df))
+  hits <- which(cand %in% c("intersection","intersections","intersection_genes","intersections.genes"))
+  if (length(hits) == 0) return(NULL)
+  names(df)[hits[1]]
+}
+
+# ----- 교집합 문자열 파싱 (빈 토큰 제거)
+split_genes <- function(x){
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  stringr::str_split(x, pattern = "[,;\\s]+", simplify = FALSE)[[1]] |>
+    stringr::str_trim() |>
+    purrr::discard(~ .x == "")
+}
+
+# ======================================================
+# 1) 라벨 테이블 / 드롭 리스트
+# ======================================================
+rename_pairs <- tibble::tribble(
+  ~source, ~term_name, ~new_label,
+  # 핵심 염증 신호
+  "KEGG","TNF signaling pathway","TNF–NFκB axis signaling",
+  "KEGG","NF-kappa B signaling pathway","NF-κB inflammatory signaling",
+  "KEGG","NOD-like receptor signaling pathway","NOD-like receptor / inflammasome priming",
+  # 치환 예시
+  "KEGG","Viral Protein interaction with cytokine and cytokine receptor","Cytosolic DNA-sensing pathway",
+  # 장 염증 맥락
+  "KEGG","Inflammatory bowel disease","IBD-like intestinal inflammatory program",
+  "KEGG","Rheumatoid arthritis","Cytokine-mediated intestinal inflammation ",
+  # 대사-면역 교차
+  "KEGG","Adipocytokine signaling pathway","Cytokine–immune crosstalk",
+  # 'lipid' 제거형 요약
+  "KEGG","Lipid and atherosclerosis","Barrier-associated inflammatory remodeling"
+)
+
+drop_terms <- c(
+  "Kaposi sarcoma-associated herpesvirus infection",
+  "African trypanosomiasis",
+  "Human cytomegalovirus infection",
+  "Malaria",
+  "Amoebiasis",
+  "Alcoholic liver disease",
+  "Leishmaniasis",
+  "Legionellosis"
+)
+
+# ======================================================
+# 2) 입출력 경로
+# ======================================================
+enrich_xlsx <- "GO_enrichment_all_contrasts.xlsx"   # ★ XLSX
+out_csv     <- "gprofiler_results/enrichment_with_labels.csv"
+plot_dir    <- ensuredir("gprofiler_plots")
+ensuredir(dirname(out_csv))
+
+# ======================================================
+# 3) XLSX 전 시트 로드 → 결합 (+ tag 보정)
+# ======================================================
+if (!file.exists(enrich_xlsx)) stop("엑셀 파일이 존재하지 않습니다: ", enrich_xlsx)
+
+sheets <- readxl::excel_sheets(enrich_xlsx)
+if (length(sheets) < 1) stop("엑셀 파일에 시트가 없습니다: ", enrich_xlsx)
+
+enr_list <- purrr::imap(sheets, function(sh, i) {
+  df <- readxl::read_excel(enrich_xlsx, sheet = sh)
+  if (nrow(df) == 0) return(NULL)
+  names(df) <- names(df) %>% stringr::str_squish()
+  if (!"tag" %in% names(df)) df$tag <- sh
+  df
+}) |> purrr::compact()
+
+if (length(enr_list) == 0) stop("모든 시트가 비어 있습니다: ", enrich_xlsx)
+
+enr <- dplyr::bind_rows(enr_list)
+
+# 필수 컬럼 확인
+required_cols <- c("tag","source","term_id","term_name","p_value","term_size","intersection_size")
+miss <- setdiff(required_cols, names(enr))
+if (length(miss) > 0) stop("입력 XLSX에 다음 컬럼이 없습니다: ", paste(miss, collapse=", "))
+
+# ======================================================
+# 4) 라벨 매핑 + 드랍
+# ======================================================
+enr_key <- enr %>%
+  dplyr::mutate(source_key = norm_key(source),
+                term_key   = norm_key(term_name))
+
+map_key <- rename_pairs %>%
+  dplyr::mutate(source_key = norm_key(source),
+                term_key   = norm_key(term_name)) %>%
+  dplyr::select(source_key, term_key, new_label)
+
+enr_labeled <- enr_key %>%
+  dplyr::left_join(map_key, by = c("source_key","term_key")) %>%
+  dplyr::mutate(
+    label              = dplyr::coalesce(new_label, term_name),
+    term_size          = to_num(term_size),
+    intersection_size  = to_num(intersection_size),
+    p_value            = to_num(p_value)
+  ) %>%
+  dplyr::select(-source_key, -term_key, -new_label)
+
+drop_key <- norm_key(drop_terms)
+enr_labeled <- enr_labeled %>%
+  dplyr::mutate(term_key  = norm_key(term_name),
+                label_key = norm_key(label)) %>%
+  dplyr::filter(!(term_key  %in% drop_key),
+                !(label_key %in% drop_key)) %>%
+  dplyr::select(-term_key, -label_key)
+
+readr::write_csv(enr_labeled, out_csv)
+message("라벨 적용 + 제외 반영 완료: ", normalizePath(out_csv))
+
+# ======================================================
+# 5) 플롯 준비/헬퍼
+# ======================================================
+prep_for_plot <- function(df, top_n = 20, wrap_width = 40) {
+  if (nrow(df) == 0) return(df)
+  df %>%
+    dplyr::mutate(
+      term_size         = to_num(term_size),
+      intersection_size = to_num(intersection_size),
+      p_value           = to_num(p_value),
+      neglog10p         = -log10(p_value + 1e-300),
+      overlap_n         = as.integer(intersection_size),
+      overlap_bin = dplyr::case_when(
+        is.na(overlap_n) ~ NA_integer_,
+        overlap_n <= 1   ~ 1L,
+        overlap_n == 2   ~ 2L,
+        overlap_n == 3   ~ 3L,
+        overlap_n == 4   ~ 4L,
+        overlap_n >= 5   ~ 5L
+      ),
+      overlap_lab = factor(overlap_bin, levels = 1:5,
+                           labels = c("1","2","3","4","≥5")),
+      plot_label = stringr::str_wrap(label, width = wrap_width)
+    ) %>%
+    dplyr::arrange(dplyr::desc(neglog10p)) %>%
+    dplyr::slice_head(n = top_n)
+}
+
+# ======================================================
+# 6) Bubble plot / Bar plot (옵션)
+# ======================================================
+make_bubble_by_source <- function(df_contrast, contrast, top_n = 20, x_limit = 6) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- prep_for_plot(dsub, top_n)
+    if (nrow(dfp) == 0) next
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(x = neglog10p, y = reorder(plot_label, neglog10p))
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = overlap_lab, color = neglog10p),
+        alpha = 0.9
+      ) +
+      ggplot2::scale_size_manual(
+        name   = "Overlap (genes)",
+        values = c(4, 9, 14, 18, 24),
+        breaks = c("1","2","3","4","≥5"),
+        labels = c("1","2","3","4","≥5"),
+        guide  = ggplot2::guide_legend(override.aes = list(alpha = 0.9))
+      ) +
+      ggplot2::scale_color_gradient(
+        name   = "-log10(p)",
+        low    = "blue",
+        high   = "red",
+        limits = c(0, x_limit)
+      ) +
+      ggplot2::scale_x_continuous(
+        limits = c(0, x_limit),
+        breaks = seq(0, x_limit, by = 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))
+      ) +
+      ggplot2::guides(
+        color = ggplot2::guide_colorbar(
+          direction      = "vertical",
+          barheight      = ggplot2::unit(12, "cm"),
+          barwidth       = ggplot2::unit(0.8, "cm"),
+          ticks          = TRUE,
+          title.position = "top"
+        ),
+        size = ggplot2::guide_legend(override.aes = list(alpha = 0.9))
+      ) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)", y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 20) +
+      ggplot2::theme(
+        legend.position = "right",
+        legend.box      = "vertical",
+        text         = ggplot2::element_text(family = BASE_FONT),
+        axis.text.y  = ggplot2::element_text(size = 24, face = "bold"),
+        axis.text.x  = ggplot2::element_text(size = 24, face = "bold"),
+        axis.title.x = ggplot2::element_text(size = 22, face = "bold",
+                                             margin = ggplot2::margin(t = 12)),
+        plot.title   = ggplot2::element_text(size = 24, face = "bold",
+                                             margin = ggplot2::margin(b = 12)),
+        legend.title = ggplot2::element_text(size = 30),
+        legend.text  = ggplot2::element_text(size = 24)
+      )
+    
+    fn <- file.path(plot_dir,
+                    paste0(gsub("[^A-Za-z0-9_\\-]+","_", contrast), "_",
+                           gsub(":","_", src), "_bubble.png"))
+    ggplot2::ggsave(fn, p, width = 15, height = 10, dpi = 600)
+    message("저장: ", normalizePath(fn))
+  }
+}
+
+make_bar_by_source <- function(df_contrast, contrast, top_n = 20) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- prep_for_plot(dsub, top_n)
+    if (nrow(dfp) == 0) next
+    
+    p <- ggplot2::ggplot(dfp, ggplot2::aes(y = reorder(plot_label, neglog10p), x = neglog10p)) +
+      ggplot2::geom_col(width = 0.65) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", neglog10p)),
+                         hjust = -0.1, size = 4, family = BASE_FONT) +
+      ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.08))) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)", y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 14) +
+      ggplot2::theme(
+        text        = ggplot2::element_text(family = BASE_FONT),
+        axis.text.y = ggplot2::element_text(size = 12),
+        plot.title  = ggplot2::element_text(face = "bold", size = 14)
+      )
+    
+    fn <- file.path(plot_dir,
+                    paste0(gsub("[^A-Za-z0-9_\\-]+","_", contrast), "_",
+                           gsub(":","_", src), "_bar.png"))
+    ggplot2::ggsave(fn, p, width = 9, height = 6.5, dpi = 300)
+    message("저장: ", normalizePath(fn))
+  }
+}
+
+# ======================================================
+# 7) 대비(tag) × source 그림 생성
+# ======================================================
+enr_labeled %>%
+  split(.$tag) %>%
+  purrr::imap(~ {
+    make_bubble_by_source(.x, .y, top_n = 20, x_limit = 6)
+    make_bar_by_source(   .x, .y, top_n = 20)
+  })
+
+message("완료: PNGs -> ", normalizePath(plot_dir))
+
+# ======================================================
+# 8) 전역 KEGG term 네트워크
+# ======================================================
+build_global_term_network <- function(enr_labeled, source_filter = "KEGG",
+                                      min_overlap = 3, jaccard_cut = 0.2){
+  
+  df0 <- enr_labeled %>%
+    dplyr::filter(source %in% source_filter) %>%
+    dplyr::mutate(p_value = to_num(p_value))
+  
+  if (nrow(df0) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  inter_col <- detect_intersection_col(df0)
+  if (is.null(inter_col))
+    stop("intersection 유전자 컬럼을 찾지 못했습니다. (g:Profiler의 'intersections' 포함 여부 확인)")
+  
+  df2 <- df0 %>%
+    dplyr::mutate(
+      neglog10p = -log10(p_value + 1e-300),
+      genes     = purrr::map(.data[[inter_col]], split_genes)
+    ) %>%
+    dplyr::filter(lengths(genes) > 0)
+  
+  if (nrow(df2) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  nodes <- df2 %>%
+    dplyr::group_by(term_id) %>%
+    dplyr::summarise(
+      term_name     = dplyr::first(term_name),
+      label         = dplyr::first(label),
+      source        = dplyr::first(source),
+      tags          = list(unique(tag)),
+      tag_count     = dplyr::n_distinct(tag),
+      neglog10p_max = max(neglog10p, na.rm = TRUE),
+      term_size     = suppressWarnings(max(as.numeric(term_size), na.rm = TRUE)),
+      genes         = list(unique(unlist(genes))),
+      .groups = "drop"
+    )
+  
+  if (nrow(nodes) < 2) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = tibble()))
+  
+  comb <- utils::combn(nodes$term_id, 2)
+  if (length(comb) == 0) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = tibble()))
+  comb  <- t(comb)
+  
+  edges <- tibble::tibble(term1 = comb[,1], term2 = comb[,2]) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term1" = "term_id")) %>%
+    dplyr::rename(genes1 = genes) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term2" = "term_id")) %>%
+    dplyr::rename(genes2 = genes) %>%
+    dplyr::mutate(
+      overlap = purrr::map2_int(genes1, genes2, ~ length(intersect(.x, .y))),
+      union_sz= purrr::map2_int(genes1, genes2, ~ length(union(.x, .y))),
+      jaccard = dplyr::if_else(union_sz > 0, overlap/union_sz, 0)
+    ) %>%
+    dplyr::filter(overlap >= min_overlap, jaccard >= jaccard_cut) %>%
+    dplyr::select(term1, term2, overlap, jaccard)
+  
+  if (nrow(edges) == 0) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = edges))
+  
+  verts_atomic <- nodes %>%
+    dplyr::transmute(
+      name = term_id,
+      term_name, label, source,
+      tag_count, neglog10p_max, term_size
+    )
+  
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = verts_atomic)
+  list(g = g, nodes = nodes, edges = edges)
+}
+
+# ----------------------------
+# (보조) Jaccard 가중 레이아웃 계산 → 노드 간격 완화
+# ----------------------------
+compute_tight_layout <- function(g, seed = 42, tighten_factor = 0.75){
+  set.seed(seed)
+  jac <- igraph::E(g)$jaccard; jac[is.na(jac)] <- 0
+  w <- scales::rescale(jac, to = c(1, 8), from = range(jac, na.rm = TRUE))
+  lay <- igraph::layout_with_fr(g, weights = w, niter = 4000, grid = "nogrid", start.temp = 0.05)
+  lay <- scale(lay); lay <- lay * tighten_factor
+  colnames(lay) <- c("x","y")
+  as.data.frame(lay)
+}
+
+plot_global_term_network <- function(net,
+                                     title = "KEGG term network (all contrasts)",
+                                     node_cap = 6,
+                                     seed = 42,
+                                     width = 30, height = 30, dpi = 600,
+                                     file_png = file.path(plot_dir, "KEGG_all_union_network.png"),
+                                     family = BASE_FONT,
+                                     fontsize = 18,
+                                     label_scale = 4.5  # ← 라벨 배율(크게). 더 키우고 싶으면 6~8까지 올려도 됨
+){
+  if (!inherits(net, "list") || is.null(net$g) ||
+      igraph::gorder(net$g) == 0 || igraph::gsize(net$g) == 0) {
+    message("노드/엣지 부족 → 스킵: ", file_png); return(invisible(NULL))
+  }
+  
+  nlogp <- igraph::V(net$g)$neglog10p_max
+  tcnt  <- igraph::V(net$g)$tag_count
+  lab   <- igraph::V(net$g)$label
+  act_cat <- dplyr::case_when(tcnt >= 3 ~ "3 contrasts",
+                              tcnt == 2 ~ "2 contrasts",
+                              TRUE      ~ "1 contrast")
+  lab_wrap <- stringr::str_wrap(lab, 38)
+  
+  net$g <- igraph::set_vertex_attr(net$g, "neglog10p_c", value = pmin(nlogp, node_cap))
+  net$g <- igraph::set_vertex_attr(net$g, "act_cat",     value = act_cat)
+  net$g <- igraph::set_vertex_attr(net$g, "label_wrap",  value = lab_wrap)
+  
+  coords <- compute_tight_layout(net$g, seed = seed, tighten_factor = 0.75)
+  
+  edge_width_fixed <- 1.2
+  p <- ggraph::ggraph(net$g, layout = "manual", x = coords$x, y = coords$y) +
+    ggraph::geom_edge_link(aes(alpha = jaccard),
+                           colour = "black", linewidth = edge_width_fixed, lineend = "round") +
+    ggraph::scale_edge_alpha(name = "Jaccard", limits = c(0,1),
+                             range = c(0.15,0.95),
+                             breaks = c(0.25,0.50,0.75,1.00),
+                             labels = c("0.25","0.50","0.75","1.00")) +
+    ggraph::geom_node_point(aes(size = neglog10p_c, fill = act_cat),
+                            shape = 21, colour = "grey10", stroke = 0.8) +
+    ggplot2::scale_size_continuous(name = "max -log10(p)", range = c(6, 22),
+                                   limits = c(0, node_cap)) +
+    ggplot2::scale_fill_manual(
+      name = "Activated in…",
+      values = c("1 contrast" = "black",
+                 "2 contrasts" = "#7B1FA2",
+                 "3 contrasts" = "#FFC107")
+    ) +
+    # ===== 라벨을 크게 =====
+  ggraph::geom_node_text(aes(label = label_wrap),
+                         repel = TRUE,
+                         family = family,
+                         size = (fontsize/3.1) * label_scale,  # ← 여기서 크게
+                         segment.alpha = .65,
+                         box.padding   = .9,
+                         point.padding = .8,
+                         max.overlaps  = Inf) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme_void(base_family = family) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = (fontsize + 6) * 2.4, face = "bold"),
+      legend.title    = ggplot2::element_text(size = (fontsize)      * 2.2, face = "bold"),
+      legend.text     = ggplot2::element_text(size = (fontsize - 2)  * 2.0),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      panel.background= ggplot2::element_rect(fill = "white", colour = NA),
+      legend.background=ggplot2::element_rect(fill = "white", colour = NA)
+    )
+  
+  ggplot2::ggsave(file_png, p, width = width, height = height, dpi = dpi)
+  message("저장: ", normalizePath(file_png))
+}
+
+
+# ---------------- 실행 ----------------
+net_all <- build_global_term_network(
+  enr_labeled,
+  source_filter = "KEGG",
+  min_overlap = 3,
+  jaccard_cut = 0.0
+)
+
+plot_global_term_network(
+  net_all,
+  title    = "KEGG term network — all contrasts (edge alpha = Jaccard)",
+  node_cap = 6,
+  file_png = file.path(plot_dir, "KEGG_all_union_network.png"),
+  family   = BASE_FONT
+)
+
+message("전체 파이프라인 완료.")
+
+# ======================================================
+# 8) 전역 KEGG term 네트워크 — 밀집/겹침 해결 버전 (전체 교체)
+# ======================================================
+
+# --- 0) 유틸 ---
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+split_genes <- function(x){
+  if (is.null(x) || is.na(x)) return(character(0))
+  x <- as.character(x)
+  unlist(strsplit(x, "[,;\\s]+"))
+}
+
+# g:Profiler 교차 유전자 컬럼 자동탐지
+detect_intersection_col <- function(df){
+  cand <- c("intersections", "intersection", "intersect", "genes", "overlap_genes")
+  cand[ cand %in% names(df) ][1]
+}
+
+# --- 1) 네트워크 구성: Jaccard + overlap 기준 필터 ---
+build_global_term_network <- function(enr_labeled, source_filter = "KEGG",
+                                      min_overlap = 3, jaccard_cut = 0.2){
+  
+  df0 <- enr_labeled %>%
+    dplyr::filter(source %in% source_filter) %>%
+    dplyr::mutate(
+      p_value = to_num(p_value),
+      neglog10p = -log10(p_value + 1e-300)
+    )
+  
+  if (nrow(df0) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  inter_col <- detect_intersection_col(df0)
+  if (is.null(inter_col))
+    stop("intersection 유전자 컬럼을 찾지 못했습니다. (g:Profiler 'intersections' 컬럼 필요)")
+  
+  df2 <- df0 %>%
+    dplyr::mutate(genes = purrr::map(.data[[inter_col]], split_genes)) %>%
+    dplyr::filter(lengths(genes) > 0)
+  
+  if (nrow(df2) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  nodes <- df2 %>%
+    dplyr::group_by(term_id) %>%
+    dplyr::summarise(
+      term_name     = dplyr::first(term_name),
+      label         = dplyr::first(label),
+      source        = dplyr::first(source),
+      tags          = list(unique(tag)),
+      tag_count     = dplyr::n_distinct(tag),
+      neglog10p_max = max(neglog10p, na.rm = TRUE),
+      term_size     = suppressWarnings(max(as.numeric(term_size), na.rm = TRUE)),
+      genes         = list(unique(unlist(genes))),
+      .groups = "drop"
+    )
+  
+  if (nrow(nodes) < 2) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = tibble()))
+  
+  comb <- utils::combn(nodes$term_id, 2)
+  comb  <- t(comb)
+  
+  edges <- tibble::tibble(term1 = comb[,1], term2 = comb[,2]) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term1" = "term_id")) %>%
+    dplyr::rename(genes1 = genes) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term2" = "term_id")) %>%
+    dplyr::rename(genes2 = genes) %>%
+    dplyr::mutate(
+      overlap = purrr::map2_int(genes1, genes2, ~ length(intersect(.x, .y))),
+      union_sz= purrr::map2_int(genes1, genes2, ~ length(union(.x, .y))),
+      jaccard = dplyr::if_else(union_sz > 0, overlap/union_sz, 0)
+    ) %>%
+    dplyr::filter(overlap >= min_overlap, jaccard >= jaccard_cut) %>%
+    dplyr::select(term1, term2, overlap, jaccard)
+  
+  if (nrow(edges) == 0) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = edges))
+  
+  verts_atomic <- nodes %>%
+    dplyr::transmute(
+      name = term_id,
+      term_name, label, source,
+      tag_count, neglog10p_max, term_size
+    )
+  
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = verts_atomic)
+  list(g = g, nodes = nodes, edges = edges)
+}
+
+# --- 2) 엣지 슬리밍: 노드당 상위 k개만 남기기 ---
+prune_edges_topk <- function(g, k = 3){
+  if (igraph::gsize(g) == 0) return(g)
+  E(g)$orig_id <- seq_len(igraph::gsize(g))
+  # 각 노드에 대해 incident edge 중 jaccard 상위 k개만 keep
+  keep_ids <- unique(unlist(lapply(V(g), function(v){
+    es <- incident(g, v, mode = "all")
+    if (length(es) <= k) return(E(g)[es]$orig_id)
+    ord <- order(E(g)[es]$jaccard, decreasing = TRUE)[seq_len(k)]
+    E(g)[es][ord]$orig_id
+  })))
+  delete_edges <- setdiff(E(g)$orig_id, keep_ids)
+  g <- igraph::delete_edges(g, E(g)[E(g)$orig_id %in% delete_edges])
+  g
+}
+
+# --- 3) 레이아웃(충돌 완화 + 분산) ---
+compute_tight_layout <- function(g, seed = 42, area_scale = 2.0, iter = 5000){
+  set.seed(seed)
+  jac <- igraph::E(g)$jaccard; jac[is.na(jac)] <- 0
+  w <- scales::rescale(jac, to = c(1, 8), from = range(jac, na.rm = TRUE))
+  # 넓은 면적/충돌 완화: area_scale, niter↑
+  lay <- igraph::layout_with_fr(g, weights = w, niter = iter, grid = "nogrid", start.temp = 0.05, area = vcount(g)^2 * area_scale)
+  lay <- scale(lay)
+  colnames(lay) <- c("x","y")
+  as.data.frame(lay)
+}
+
+# --- 4) 플로팅: 라벨 겹침 방지/가독성 극대화 ---
+plot_global_term_network <- function(net,
+                                     title = "KEGG term network — all contrasts (edge α = Jaccard)",
+                                     node_cap = 6,
+                                     seed = 42,
+                                     width = 40, height = 32, dpi = 600,
+                                     file_png = file.path(plot_dir, "KEGG_all_union_network.png"),
+                                     family = BASE_FONT,
+                                     fontsize = 12,
+                                     label_scale = 5.5,         # 라벨 크게
+                                     edge_topk = 3,             # 노드당 유지할 최대 엣지 수
+                                     save = FALSE){
+  
+  if (!inherits(net, "list") || is.null(net$g) ||
+      igraph::gorder(net$g) == 0 || igraph::gsize(net$g) == 0) {
+    message("노드/엣지 부족 → 스킵: ", file_png); return(invisible(NULL))
+  }
+  
+  # 4-1) 엣지 슬리밍
+  g <- prune_edges_topk(net$g, k = edge_topk)
+  
+  # 4-2) 속성 준비
+  nlogp <- igraph::V(g)$neglog10p_max
+  tcnt  <- igraph::V(g)$tag_count
+  lab   <- igraph::V(g)$label
+  act_cat <- dplyr::case_when(tcnt >= 3 ~ "3 contrasts",
+                              tcnt == 2 ~ "2 contrasts",
+                              TRUE      ~ "1 contrast")
+  lab_wrap <- stringr::str_wrap(lab, 38)
+  
+  g <- igraph::set_vertex_attr(g, "neglog10p_c", value = pmin(nlogp, node_cap))
+  g <- igraph::set_vertex_attr(g, "act_cat",     value = act_cat)
+  g <- igraph::set_vertex_attr(g, "label_wrap",  value = lab_wrap)
+  
+  # 4-3) 레이아웃(넓은 공간, 충돌 최소화)
+  coords <- compute_tight_layout(g, seed = seed, area_scale = 2.5, iter = 6000)
+  
+  # 4-4) 그리기
+  edge_width_fixed <- 0.8
+  p <- ggraph::ggraph(g, layout = "manual", x = coords$x, y = coords$y) +
+    # 엣지: 얇고 투명도 크게 떨어뜨림
+    ggraph::geom_edge_link(aes(alpha = jaccard),
+                           colour = "black", linewidth = edge_width_fixed, lineend = "round") +
+    ggraph::scale_edge_alpha(name = "Jaccard", limits = c(0,1),
+                             range = c(0.05,0.65),
+                             breaks = c(0.25,0.50,0.75,1.00),
+                             labels = c("0.25","0.50","0.75","1.00")) +
+    # 노드
+    ggraph::geom_node_point(aes(size = neglog10p_c, fill = act_cat),
+                            shape = 21, colour = "grey10", stroke = 0.9) +
+    ggplot2::scale_size_continuous(name = "max -log10(p)", range = c(7, 26),
+                                   limits = c(0, node_cap)) +
+    ggplot2::scale_fill_manual(
+      name = "Activated in…",
+      values = c("1 contrast" = "black",
+                 "2 contrasts" = "#7B1FA2",
+                 "3 contrasts" = "#FFC107")
+    ) +
+    # 라벨: 박스+리더라인, 강한 repel, 넉넉한 패딩
+    ggraph::geom_node_label(aes(label = label_wrap),
+                            repel = TRUE,
+                            family = family,
+                            size = (fontsize/3.1) * label_scale,
+                            label.size = 0.25,
+                            label.padding = unit(0.28, "lines"),
+                            label.r = unit(0.2, "lines"),
+                            fill = "white",
+                            colour = "black",
+                            segment.colour = "grey15",
+                            segment.size = 0.5,
+                            segment.alpha = .85,
+                            force = 2.5,           # ← 밀어내는 힘
+                            max.overlaps = Inf,
+                            box.padding   = 0.9,
+                            point.padding = 0.8) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme_void(base_family = family) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = (fontsize + 6) * 2.2, face = "bold"),
+      legend.title    = ggplot2::element_text(size = (fontsize)      * 2.0, face = "bold"),
+      legend.text     = ggplot2::element_text(size = (fontsize - 2)  * 1.8),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      panel.background= ggplot2::element_rect(fill = "white", colour = NA),
+      legend.background=ggplot2::element_rect(fill = "white", colour = NA),
+      plot.margin     = margin(20, 20, 20, 20)
+    )
+  
+  # 화면 출력 + (옵션) 저장
+  print(p)
+  if (isTRUE(save)) {
+    ggplot2::ggsave(file_png, p, width = width, height = height, dpi = dpi)
+    message("저장: ", normalizePath(file_png))
+  }
+  invisible(p)
+}
+
+# ---------------- 실행 예 ----------------
+net_all <- build_global_term_network(
+  enr_labeled,
+  source_filter = "KEGG",
+  min_overlap = 3,       # 필요시 4~5로 올리면 더 듬성듬성
+  jaccard_cut = 0.2      # 0.2~0.3 권장; 너무 촘촘하면 ↑
+)
+
+plot_global_term_network(
+  net_all,
+  title     = "KEGG term network — all contrasts (edge α = Jaccard)",
+  node_cap  = 6,
+  family    = BASE_FONT,
+  label_scale = 6.0,     # 라벨 더 크게 원하면 7~8
+  edge_topk   = 3,       # 노드당 최대 3개의 엣지만 유지
+  save = FALSE           # 화면 출력; 저장 원하면 TRUE
+)
+
+

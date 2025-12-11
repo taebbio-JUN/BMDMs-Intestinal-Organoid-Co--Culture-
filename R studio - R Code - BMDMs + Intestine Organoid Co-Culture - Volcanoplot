@@ -1,0 +1,426 @@
+---
+title: "BMDMs Stemness Volcaonplot Part"
+author: "TaeBaek Lee"
+date: "2025-10-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl);  library(writexl)     # ← 엑셀 저장
+  library(dplyr);   library(stringr);    library(tidyr);  library(purrr)
+  library(ggplot2); library(ggrepel); library(grid)     # ← Volcano
+})
+
+# ========= 공통 설정 =========
+font_family <- if (.Platform$OS.type == "windows") "Arial" else "Helvetica"
+up_col   <- "#F2C94C"
+down_col <- "#512DA8"
+ns_col   <- "grey80"
+
+# =========================
+# 1) 원자료 → long 포맷 (네 기존 로직 그대로)
+# =========================
+excel_path <- "BMDMs_Stemness_Part.xlsx"
+sheet_name <- "Sheet1"
+
+group_means <- c("control", "BMDMs 1k", "BMDMs 5k",
+                 "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (length(row_label_col) == 0 || is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- dplyr::mutate(df_raw, .endpoint = as.character(.data[[row_label_col]]))
+
+cn <- names(df_raw)
+mean_idx <- match(group_means, cn)
+if (any(is.na(mean_idx))) stop("헤더에서 못 찾은 그룹: ", paste(group_means[is.na(mean_idx)], collapse=", "))
+sd_idx <- mean_idx + 1L; n_idx <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) stop("mean, SD, N 순서(3열 블록) 확인 필요")
+
+mean_names <- group_means
+sd_names   <- paste0(group_means, "_sd")
+n_names    <- paste0(group_means, "_n")
+
+long_mean <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(mean_idx)) |>
+  stats::setNames(c(".endpoint", mean_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(sd_idx)) |>
+  stats::setNames(c(".endpoint", sd_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(sd_names), names_to = "group_sd", values_to = "sd") |>
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) |>
+  dplyr::select(-group_sd)
+
+long_n <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(n_idx)) |>
+  stats::setNames(c(".endpoint", n_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(n_names), names_to = "group_n", values_to = "n") |>
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) |>
+  dplyr::select(-group_n)
+
+dat_long <- long_mean |>
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) |>
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) |>
+  dplyr::mutate(
+    mean = suppressWarnings(as.numeric(mean)),
+    sd   = suppressWarnings(as.numeric(sd)),
+    n    = suppressWarnings(as.numeric(n))
+  ) |>
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 2) 통계 요약 함수 (control vs 각 그룹) → log2FC, p, p_adj
+# =========================
+compute_summary <- function(dat_long, baseline, treat_groups) {
+  ctrl_df <- dat_long |>
+    dplyr::filter(group == baseline) |>
+    dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+  
+  out <- purrr::map_dfr(treat_groups, function(g) {
+    dat_long |>
+      dplyr::filter(group == g) |>
+      dplyr::transmute(.endpoint, group, mean_t = mean, sd_t = sd, n_t = n) |>
+      dplyr::left_join(ctrl_df, by = ".endpoint") |>
+      dplyr::mutate(
+        log2FC = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+        se2    = (sd_t^2/n_t) + (sd_c^2/n_c),
+        t_stat = (mean_t - mean_c)/sqrt(se2),
+        df_welch = se2^2 / ( (sd_t^2/n_t)^2/pmax(n_t-1,1) + (sd_c^2/n_c)^2/pmax(n_c-1,1) ),
+        p_value = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE)
+      ) |>
+      dplyr::mutate(baseline = baseline) |>
+      dplyr::select(.endpoint, baseline, group, log2FC, p_value)
+  }) |>
+    dplyr::group_by(group) |>
+    dplyr::mutate(p_adj = p.adjust(p_value, "BH")) |>
+    dplyr::ungroup()
+  
+  # 보기용 그룹명(‘tnfa’ → ‘TNF-α’ 등)
+  pretty_map <- c("tnfa"="TNF-α", "tnfa BMDMs 1k"="TNF-α + BMDMs 1k", "tnfa BMDMs 5k"="TNF-α + BMDMs 5k")
+  out$group_pretty <- ifelse(out$group %in% names(pretty_map), unname(pretty_map[out$group]), out$group)
+  out
+}
+
+treat_groups <- c("BMDMs 1k", "BMDMs 5k", "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+summary_all <- compute_summary(dat_long, baseline = "control", treat_groups = treat_groups)
+
+# =========================
+# 3) 엑셀로 저장 (시트 5개)
+# =========================
+# 각 그룹별 테이블을 list로 만들어 write_xlsx에 넘긴다
+tbl_list <- split(summary_all, summary_all$group_pretty) |>
+  purrr::map(\(df) dplyr::select(df,
+                                 .endpoint, baseline,
+                                 group = group_pretty,
+                                 log2FC, p_value, p_adj))
+out_xlsx <- "Volcano_input_summary.xlsx"
+writexl::write_xlsx(tbl_list, path = out_xlsx)
+message("Saved: ", normalizePath(out_xlsx))
+
+# =========================
+# 4) (재현) 엑셀에서 읽어 Volcano plot 생성
+# =========================
+volcano_from_excel <- function(xlsx_path,
+                               p_use = c("adj","raw"),
+                               p_thresh = 0.05,
+                               fc_thresh = log2(1.5)) {
+  p_use <- match.arg(p_use)
+  sheets <- readxl::excel_sheets(xlsx_path)
+  df_list <- lapply(sheets, function(s) readxl::read_excel(xlsx_path, sheet = s))
+  df_all  <- dplyr::bind_rows(df_list, .id = "sheet_id")
+  names(df_all)[names(df_all)=="group"] <- "group_pretty"
+  
+  # 전역 축 범위
+  x_lim <- max(abs(df_all$log2FC), na.rm = TRUE)
+  x_lim <- max(x_lim, fc_thresh)
+  xlim_all <- c(-x_lim, x_lim)
+  
+  pcol <- if (p_use == "adj") "p_adj" else "p_value"
+  df_all[[pcol]] <- pmax(df_all[[pcol]], 1e-300)
+  y_lim <- max(-log10(df_all[[pcol]]), na.rm = TRUE)
+  y_lim <- max(y_lim, -log10(p_thresh) + 0.5)
+  ylim_all <- c(0, y_lim)
+  # 전역 축 범위 (원래 계산하던 코드 그대로 두어도 됨)
+  x_lim <- max(abs(df_all$log2FC), na.rm = TRUE)
+  x_lim <- max(x_lim, fc_thresh)
+  xlim_all <- c(-x_lim, x_lim)
+  
+  pcol <- if (p_use == "adj") "p_adj" else "p_value"
+  df_all[[pcol]] <- pmax(df_all[[pcol]], 1e-300)
+  y_lim <- max(-log10(df_all[[pcol]]), na.rm = TRUE)
+  y_lim <- max(y_lim, -log10(p_thresh) + 0.5)
+  ylim_all <- c(0, y_lim)
+  
+  # ===== 여기서 ‘강제 고정’ 덮어쓰기 =====
+  xlim_all <- c(-6, 6)
+  ylim_all <- c(0, 5)
+  # ====================================
+  mk_one <- function(df1) {
+    df1 <- df1 |>
+      mutate(p_show = if (p_use=="adj") p_adj else p_value,
+             p_show = pmax(p_show, 1e-300),
+             neglog10 = -log10(p_show),
+             status = case_when(
+               p_show < p_thresh & log2FC >=  fc_thresh ~ "Up",
+               p_show < p_thresh & log2FC <= -fc_thresh ~ "Down",
+               TRUE ~ "NS"
+             ))
+    ggplot(df1, aes(x = log2FC, y = neglog10)) +
+      geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_vline(xintercept = c(-fc_thresh, fc_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_point(aes(color = status), size = 2.2, alpha = 0.9) +
+      scale_color_manual(values = c("Down"=down_col, "NS"=ns_col, "Up"=up_col),
+                         breaks = c("Down","NS","Up")) +
+      coord_cartesian(xlim = xlim_all, ylim = ylim_all, expand = FALSE) +
+      labs(
+        title = unique(df1$group_pretty),
+        x = "log2(Fold Change)",
+        y = if (p_use=="adj") expression(-log[10]("BH-adjusted p")) else expression(-log[10](p))
+      ) +
+      theme_bw(base_family = font_family) +
+      theme(
+        plot.title = element_text(face = "bold", size =35, hjust = 0.5),
+        axis.title = element_text(size =30, color = "black"),
+        axis.text  = element_text(size =30, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(2, 6, 2, 6, unit = "mm")
+      ) +
+      ggrepel::geom_text_repel(
+        data = df1 %>% filter(status != "NS"),
+        aes(label = .endpoint),
+        size = 10, family = font_family, fontface = "italic",
+        max.overlaps = 30, box.padding = 0.25, point.padding = 0.2,
+        min.segment.length = 0, seed = 123
+      )
+  }
+  
+  plots <- df_all %>% group_split(group_pretty) %>% purrr::map(mk_one)
+  names(plots) <- unique(df_all$group_pretty)
+  list(plots = plots, xlim = xlim_all, ylim = ylim_all)
+}
+
+# 실행: 엑셀에서 읽어 Volcano 그리기
+res <- volcano_from_excel(out_xlsx, p_use = "adj", p_thresh = 0.05, fc_thresh = log2(1.5))
+graphics.off()
+invisible(lapply(res$plots, print))
+
+# (선택) 저장
+# dir.create("volcano_out", FALSE)
+# purrr::iwalk(res$plots, ~ ggsave(file.path("volcano_out", paste0("Volcano_", .y, ".png")),
+#                                  plot = .x, width = 5, height = 4, dpi = 300))
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl);  library(writexl)     # ← 엑셀 저장
+  library(dplyr);   library(stringr);    library(tidyr);  library(purrr)
+  library(ggplot2); library(ggrepel);    library(grid)    # ← Volcano
+})
+
+# ========= 공통 설정 =========
+font_family <- if (.Platform$OS.type == "windows") "Arial" else "Helvetica"
+up_col   <- "#F2C94C"
+down_col <- "#512DA8"
+ns_col   <- "grey80"
+
+# =========================
+# 1) 원자료 → long 포맷
+# =========================
+excel_path <- "BMDMs_Stemness_Part.xlsx"
+sheet_name <- "Sheet1"
+
+group_means <- c("control", "BMDMs 1k", "BMDMs 5k",
+                 "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (length(row_label_col) == 0 || is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- dplyr::mutate(df_raw, .endpoint = as.character(.data[[row_label_col]]))
+
+cn <- names(df_raw)
+mean_idx <- match(group_means, cn)
+if (any(is.na(mean_idx))) stop("헤더에서 못 찾은 그룹: ", paste(group_means[is.na(mean_idx)], collapse=", "))
+sd_idx <- mean_idx + 1L; n_idx <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) stop("mean, SD, N 순서(3열 블록) 확인 필요")
+
+mean_names <- group_means
+sd_names   <- paste0(group_means, "_sd")
+n_names    <- paste0(group_means, "_n")
+
+long_mean <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(mean_idx)) |>
+  stats::setNames(c(".endpoint", mean_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(sd_idx)) |>
+  stats::setNames(c(".endpoint", sd_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(sd_names), names_to = "group_sd", values_to = "sd") |>
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) |>
+  dplyr::select(-group_sd)
+
+long_n <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(n_idx)) |>
+  stats::setNames(c(".endpoint", n_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(n_names), names_to = "group_n", values_to = "n") |>
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) |>
+  dplyr::select(-group_n)
+
+dat_long <- long_mean |>
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) |>
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) |>
+  dplyr::mutate(
+    mean = suppressWarnings(as.numeric(mean)),
+    sd   = suppressWarnings(as.numeric(sd)),
+    n    = suppressWarnings(as.numeric(n))
+  ) |>
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 2) 통계 요약 (control vs 각 그룹) → log2FC, p(raw), p_adj
+# =========================
+compute_summary <- function(dat_long, baseline, treat_groups) {
+  ctrl_df <- dat_long |>
+    dplyr::filter(group == baseline) |>
+    dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+  
+  out <- purrr::map_dfr(treat_groups, function(g) {
+    dat_long |>
+      dplyr::filter(group == g) |>
+      dplyr::transmute(.endpoint, group, mean_t = mean, sd_t = sd, n_t = n) |>
+      dplyr::left_join(ctrl_df, by = ".endpoint") |>
+      dplyr::mutate(
+        log2FC = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+        se2    = (sd_t^2/n_t) + (sd_c^2/n_c),
+        t_stat = (mean_t - mean_c)/sqrt(se2),
+        df_welch = se2^2 / ( (sd_t^2/n_t)^2/pmax(n_t-1,1) + (sd_c^2/n_c)^2/pmax(n_c-1,1) ),
+        p_value = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE)
+      ) |>
+      dplyr::mutate(baseline = baseline) |>
+      dplyr::select(.endpoint, baseline, group, log2FC, p_value)
+  }) |>
+    dplyr::group_by(group) |>
+    dplyr::mutate(p_adj = p.adjust(p_value, "BH")) |>
+    dplyr::ungroup()
+  
+  # 보기용 그룹명(‘tnfa’ → ‘TNF-α’ 등)
+  pretty_map <- c("tnfa"="TNF-α", "tnfa BMDMs 1k"="TNF-α + BMDMs 1k", "tnfa BMDMs 5k"="TNF-α + BMDMs 5k")
+  out$group_pretty <- ifelse(out$group %in% names(pretty_map), unname(pretty_map[out$group]), out$group)
+  out
+}
+
+treat_groups <- c("BMDMs 1k", "BMDMs 5k", "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+summary_all <- compute_summary(dat_long, baseline = "control", treat_groups = treat_groups)
+
+# =========================
+# 3) 엑셀로 저장 (시트 5개)
+# =========================
+tbl_list <- split(summary_all, summary_all$group_pretty) |>
+  purrr::map(\(df) dplyr::select(df,
+                                 .endpoint, baseline,
+                                 group = group_pretty,
+                                 log2FC, p_value, p_adj))
+out_xlsx <- "Volcano_input_summary.xlsx"
+writexl::write_xlsx(tbl_list, path = out_xlsx)
+message("Saved: ", normalizePath(out_xlsx))
+
+# =========================
+# 4) 엑셀에서 읽어 Volcano plot 생성
+#     └ 기본: raw p 사용(= y축 −log10(p-value))
+# =========================
+volcano_from_excel <- function(xlsx_path,
+                               p_use = c("raw","adj"),   # ← 기본을 raw로 고정
+                               p_thresh = 0.05,
+                               fc_thresh = log2(1.5)) {
+  p_use <- match.arg(p_use)
+  sheets  <- readxl::excel_sheets(xlsx_path)
+  df_list <- lapply(sheets, function(s) readxl::read_excel(xlsx_path, sheet = s))
+  df_all  <- dplyr::bind_rows(df_list, .id = "sheet_id")
+  names(df_all)[names(df_all)=="group"] <- "group_pretty"
+  
+  # 전역 축 범위 계산
+  x_lim <- max(abs(df_all$log2FC), na.rm = TRUE)
+  x_lim <- max(x_lim, fc_thresh)
+  xlim_all <- c(-x_lim, x_lim)
+  
+  pcol <- if (p_use == "adj") "p_adj" else "p_value"
+  df_all[[pcol]] <- pmax(df_all[[pcol]], 1e-300)
+  y_lim <- max(-log10(df_all[[pcol]]), na.rm = TRUE)
+  y_lim <- max(y_lim, -log10(p_thresh) + 0.5)
+  ylim_all <- c(0, y_lim)
+  
+  # ===== 필요시 강제 고정(유지) =====
+  xlim_all <- c(-6, 6)
+  ylim_all <- c(0, 6)
+  # =================================
+  
+  mk_one <- function(df1) {
+    df1 <- df1 |>
+      dplyr::mutate(
+        p_show = if (p_use=="adj") p_adj else p_value,
+        p_show = pmax(p_show, 1e-300),
+        neglog10 = -log10(p_show),
+        status = dplyr::case_when(
+          p_show < p_thresh & log2FC >=  fc_thresh ~ "Up",
+          p_show < p_thresh & log2FC <= -fc_thresh ~ "Down",
+          TRUE ~ "NS"
+        )
+      )
+    ggplot(df1, aes(x = log2FC, y = neglog10)) +
+      geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_vline(xintercept = c(-fc_thresh, fc_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_point(aes(color = status), size = 2.2, alpha = 0.9) +
+      scale_color_manual(values = c("Down"=down_col, "NS"=ns_col, "Up"=up_col),
+                         breaks = c("Down","NS","Up")) +
+      coord_cartesian(xlim = xlim_all, ylim = ylim_all, expand = FALSE) +
+      labs(
+        title = unique(df1$group_pretty),
+        x = "log2(Fold Change)",
+        y = if (p_use=="adj")
+          expression(-log[10]("BH-adjusted p"))
+        else
+          expression(-log[10]("p-value"))   # ← 명시적 표기
+      ) +
+      theme_bw(base_family = font_family) +
+      theme(
+        plot.title = element_text(face = "bold", size = 35, hjust = 0.5),
+        axis.title = element_text(size = 30, color = "black"),
+        axis.text  = element_text(size = 30, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(2, 6, 2, 6, unit = "mm")
+      ) +
+      ggrepel::geom_text_repel(
+        data = dplyr::filter(df1, status != "NS"),
+        aes(label = .endpoint),
+        size = 10, family = font_family, fontface = "italic",
+        max.overlaps = 30, box.padding = 0.25, point.padding = 0.2,
+        min.segment.length = 0, seed = 123
+      )
+  }
+  
+  plots <- df_all %>% dplyr::group_split(group_pretty) %>% purrr::map(mk_one)
+  names(plots) <- unique(df_all$group_pretty)
+  list(plots = plots, xlim = xlim_all, ylim = ylim_all)
+}
+
+# =========================
+# 실행: y축 = −log10(raw p-value)
+# =========================
+res <- volcano_from_excel(out_xlsx, p_use = "raw", p_thresh = 0.05, fc_thresh = log2(1.5))
+graphics.off()
+invisible(lapply(res$plots, print))
+
+# (선택) 저장
+dir.create("volcano_out", FALSE)
+purrr::iwalk(res$plots, ~ ggsave(file.path("volcano_out", paste0("Volcano_", .y, ".png")),
+                                 plot = .x, width = 9, height = 7, dpi = 300))

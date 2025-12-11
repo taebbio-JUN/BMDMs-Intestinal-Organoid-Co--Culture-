@@ -1,0 +1,1422 @@
+---
+title: "BMDMs Co-Culture Bioinformatics Anaylsis"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(readr)
+  library(grid)
+})
+
+# =========================
+# Helper: p-value to stars
+# =========================
+p_to_stars <- function(p) {
+  ifelse(
+    is.na(p), "",
+    ifelse(p < 0.001, "***",
+      ifelse(p < 0.01,  "**",
+        ifelse(p < 0.05, "*", "")
+      )
+    )
+  )
+}
+
+# =========================
+# File / sheet / parameters
+# =========================
+excel_path <- "BMDMs Co-culture Inflammation qPCR Result.xlsx"
+sheet_name <- "Sheet1"
+
+group_means <- c(
+  "control",
+  "BMDMs 1k",
+  "BMDMs 5k",
+  "tnfa",
+  "tnfa BMDMs 1k",
+  "tnfa BMDMs 5k"
+)
+
+control_name <- "control"
+
+# Font family for plotting (change if needed)
+ff <- "Helvetica"
+
+# =========================
+# 1) Read data
+# =========================
+df_raw <- read_excel(excel_path, sheet = sheet_name)
+
+# Detect endpoint label column from the first two columns
+candidate_label_cols <- names(df_raw)[1:2]
+label_counts <- colSums(!is.na(df_raw[candidate_label_cols]))
+row_label_col <- candidate_label_cols[which.max(label_counts)]
+
+if (is.na(row_label_col) || length(row_label_col) == 0) {
+  row_label_col <- names(df_raw)[1]
+}
+
+df_raw <- df_raw %>%
+  mutate(
+    .endpoint = pull(., !!sym(row_label_col)) %>%
+      as.character()
+  )
+
+# =========================
+# 2) Map mean, SD, n columns
+# =========================
+cn <- names(df_raw)
+
+mean_idx <- match(group_means, cn)
+if (any(is.na(mean_idx))) {
+  stop(
+    "Columns not found for the following groups: ",
+    paste(group_means[is.na(mean_idx)], collapse = ", ")
+  )
+}
+
+sd_idx <- mean_idx + 1L
+n_idx  <- mean_idx + 2L
+
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) {
+  stop("SD or N columns are out of range. Check mean–SD–n 3-column blocks.")
+}
+
+mean_cols <- cn[mean_idx]
+sd_cols   <- cn[sd_idx]
+n_cols    <- cn[n_idx]
+
+mean_names <- group_means
+sd_names   <- paste0(group_means, "_sd")
+n_names    <- paste0(group_means, "_n")
+
+# =========================
+# 3) Long-format mean / SD / n
+# =========================
+long_mean <- df_raw %>%
+  select(.endpoint, all_of(mean_cols)) %>%
+  setNames(c(".endpoint", mean_names)) %>%
+  pivot_longer(
+    cols = all_of(mean_names),
+    names_to = "group",
+    values_to = "mean"
+  )
+
+long_sd <- df_raw %>%
+  select(.endpoint, all_of(sd_cols)) %>%
+  setNames(c(".endpoint", sd_names)) %>%
+  pivot_longer(
+    cols = all_of(sd_names),
+    names_to = "group_sd",
+    values_to = "sd"
+  ) %>%
+  mutate(group = str_remove(group_sd, "_sd")) %>%
+  select(-group_sd)
+
+long_n <- df_raw %>%
+  select(.endpoint, all_of(n_cols)) %>%
+  setNames(c(".endpoint", n_names)) %>%
+  pivot_longer(
+    cols = all_of(n_names),
+    names_to = "group_n",
+    values_to = "n"
+  ) %>%
+  mutate(group = str_remove(group_n, "_n")) %>%
+  select(-group_n)
+
+dat_long <- long_mean %>%
+  left_join(long_sd, by = c(".endpoint", "group")) %>%
+  left_join(long_n,  by = c(".endpoint", "group")) %>%
+  mutate(
+    mean = as.numeric(mean),
+    sd   = as.numeric(sd),
+    n    = as.numeric(n)
+  ) %>%
+  filter(
+    !is.na(mean),
+    !is.na(sd),
+    !is.na(n)
+  )
+
+# =========================
+# 4) Welch t-test + log2FC
+# =========================
+if (!(control_name %in% dat_long$group)) {
+  stop("control_name not found in dat_long$group. Check 'control_name'.")
+}
+
+# Control summary
+ctrl_df <- dat_long %>%
+  filter(group == control_name) %>%
+  transmute(
+    .endpoint,
+    mean_c = mean,
+    sd_c   = sd,
+    n_c    = n
+  )
+
+# All treatment groups to be compared vs control
+all_treat_groups <- c(
+  "BMDMs 1k",
+  "BMDMs 5k",
+  "tnfa",
+  "tnfa BMDMs 1k",
+  "tnfa BMDMs 5k"
+)
+
+missing_tg <- setdiff(all_treat_groups, unique(dat_long$group))
+if (length(missing_tg) > 0) {
+  stop(
+    "The following groups are missing in the data: ",
+    paste(missing_tg, collapse = ", ")
+  )
+}
+
+# Compute Welch t-test and log2FC for each treatment group
+res_list <- lapply(all_treat_groups, function(g) {
+  dat_long %>%
+    filter(group == g) %>%
+    transmute(
+      .endpoint,
+      group,
+      mean_t = mean,
+      sd_t   = sd,
+      n_t    = n
+    ) %>%
+    left_join(ctrl_df, by = ".endpoint") %>%
+    mutate(
+      log2FC = log2((mean_t + 1e-12) / (mean_c + 1e-12)),
+      se2    = (sd_t^2 / n_t) + (sd_c^2 / n_c),
+      t_stat = (mean_t - mean_c) / sqrt(se2),
+      df_welch = se2^2 / (
+        (sd_t^2 / n_t)^2 / (pmax(n_t - 1, 1) + 1e-12) +
+          (sd_c^2 / n_c)^2 / (pmax(n_c - 1, 1) + 1e-12)
+      ),
+      p_value = 2 * pt(abs(t_stat), df = df_welch, lower.tail = FALSE),
+      contrast = paste0(g, " vs ", control_name)
+    ) %>%
+    select(
+      .endpoint, contrast, group,
+      mean_c, sd_c, n_c,
+      mean_t, sd_t, n_t,
+      log2FC, t_stat, df_welch, p_value
+    )
+})
+
+res_all <- bind_rows(res_list) %>%
+  group_by(contrast) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  ungroup() %>%
+  mutate(stars = p_to_stars(p_value))  # stars based on raw p-values
+
+# =========================
+# 5) Global color scale for log2FC
+# =========================
+lim <- max(1, quantile(abs(res_all$log2FC), 0.95, na.rm = TRUE))
+col_fun <- colorRamp2(
+  c(-lim, 0, lim),
+  c("#7E57C2", "#f7f7f7", "#F2C94C")
+)
+
+# =========================
+# 6) Heatmap helper
+# =========================
+make_heatmap_for <- function(groups, title = NULL) {
+  # Log2FC matrix
+  mat_log2fc <- res_all %>%
+    filter(group %in% groups) %>%
+    mutate(group = factor(group, levels = groups)) %>%
+    select(.endpoint, group, log2FC) %>%
+    pivot_wider(
+      names_from = group,
+      values_from = log2FC
+    ) %>%
+    column_to_rownames(".endpoint") %>%
+    as.matrix()
+
+  # Stars matrix
+  mat_star <- res_all %>%
+    filter(group %in% groups) %>%
+    mutate(group = factor(group, levels = groups)) %>%
+    select(.endpoint, group, stars) %>%
+    pivot_wider(
+      names_from = group,
+      values_from = stars
+    ) %>%
+    column_to_rownames(".endpoint") %>%
+    as.matrix()
+
+  # Column display labels: replace "tnfa" with "TNFα"
+  disp_names <- colnames(mat_log2fc)
+  disp_names <- str_replace_all(disp_names, "\\btnfa\\b", "TNF\u03B1")
+  colnames(mat_log2fc) <- disp_names
+  colnames(mat_star)   <- disp_names
+
+  ht <- Heatmap(
+    mat_log2fc,
+    name = "log2(FC)",
+    col = col_fun,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    column_order = disp_names,
+    na_col = "grey90",
+    rect_gp = gpar(col = "white"),
+    row_names_gp = gpar(
+      fontsize   = 24,
+      fontfamily = ff,
+      fontface   = "italic"
+    ),
+    column_names_gp = gpar(
+      fontsize   = 24,
+      fontfamily = ff
+    ),
+    column_names_rot = 45,
+    column_title = title,
+    column_title_gp = gpar(
+      fontsize   = 24,
+      fontfamily = ff
+    ),
+    heatmap_legend_param = list(
+      title      = "log2(FC)",
+      direction  = "horizontal",
+      title_gp   = gpar(
+        fontsize   = 24,
+        fontfamily = ff,
+        fontface   = "bold"
+      ),
+      labels_gp  = gpar(
+        fontsize   = 24,
+        fontfamily = ff
+      )
+    ),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      lab <- mat_star[i, j]
+      if (!is.na(lab) && nzchar(lab)) {
+        grid.text(
+          lab,
+          x = x,
+          y = y,
+          gp = gpar(
+            fontsize   = 24,
+            fontfamily = ff,
+            fontface   = "bold"
+          )
+        )
+      }
+    )
+  )
+
+  draw(
+    ht,
+    heatmap_legend_side = "bottom",
+    padding = unit(c(5, 5, 10, 5), "mm")
+  )
+}
+
+# =========================
+# 7) Generate heatmaps
+# =========================
+groups_set1 <- c("BMDMs 1k", "BMDMs 5k")
+groups_set2 <- c("tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+
+make_heatmap_for(groups_set1, title = "BMDMs-only (vs control)")
+make_heatmap_for(groups_set2, title = "TNF\u03B1 \u00b1 BMDMs (vs control)")
+---
+title: "BMDMs Inflammation gProfiler 2 Anaylsis Part."
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(ggplot2); library(stringr)
+})
+
+# =========================
+# Fonts (Windows에서 Helvetica 대체)
+# =========================
+base_family <- "Helvetica"
+if (.Platform$OS.type == "windows") {
+  windowsFonts(Helvetica = windowsFont("Arial"))  # Helvetica 별칭을 Arial로 매핑
+}
+
+# =========================
+# 설정
+# =========================
+excel_path <- "gProfiler_mmusculus___intersections _ BMDMs.xlsx"
+sheet_1k   <- "gProfiler_mmusculus_1K BMDMS Co"
+sheet_5k   <- "gProfiler_mmusculus_5K BMDMs"
+
+top5_5k <- 5   # 5k 상위 N
+top3_1k <- 5   # 1k 상위 N (0은 제외)
+xmax    <- 5   # 공통 x축 상한
+
+# 색상: 1K=노랑, 5K=보라
+col_1k  <- "#A68FC1"  
+col_5k  <- "#C49AC6"  
+
+# =========================
+# 유틸
+# =========================
+read_kegg <- function(path, sheet){
+  read_excel(path, sheet = sheet) %>%
+    dplyr::filter(toupper(source) == "KEGG") %>%
+    dplyr::mutate(
+      neglog10FDR = dplyr::coalesce(
+        suppressWarnings(as.numeric(negative_log10_of_adjusted_p_value)),
+        -log10(suppressWarnings(as.numeric(adjusted_p_value)))
+      ),
+      term = as.character(term_name),
+      intersection_size = suppressWarnings(as.numeric(intersection_size))
+    ) %>%
+    dplyr::filter(!is.na(neglog10FDR), neglog10FDR >= 0)
+}
+
+# =========================
+# 데이터 로드 & 선택
+# =========================
+k5k <- read_kegg(excel_path, sheet_5k) %>%
+  arrange(desc(neglog10FDR)) %>%
+  slice_head(n = top5_5k) %>%
+  mutate(group = "BMDMs 5k")
+
+k1k <- read_kegg(excel_path, sheet_1k) %>%
+  filter(neglog10FDR > 0) %>%                 # 0 값 제거
+  arrange(desc(neglog10FDR)) %>%
+  slice_head(n = top3_1k) %>%
+  mutate(group = "BMDMs 1k")
+
+# =========================
+# Y축을 숫자 좌표로(중복 라벨 허용) — 위=5k, 아래=1k
+# =========================
+k5k_ord <- k5k %>% arrange(desc(neglog10FDR))
+k1k_ord <- k1k %>% arrange(desc(neglog10FDR))
+n5 <- nrow(k5k_ord); n1 <- nrow(k1k_ord)
+
+y_vals_5k <- seq(from = n5 + n1, to = n1 + 1, by = -1)  # 위쪽 블록
+y_vals_1k <- seq(from = n1,       to = 1,     by = -1)  # 아래쪽 블록
+
+k5k_plot <- k5k_ord %>%
+  mutate(ypos = y_vals_5k) %>%
+  transmute(ypos, term, neglog10FDR, intersection_size, group)
+
+k1k_plot <- k1k_ord %>%
+  mutate(ypos = y_vals_1k) %>%
+  transmute(ypos, term, neglog10FDR, intersection_size, group)
+
+df_plot  <- bind_rows(k5k_plot, k1k_plot) %>%
+  mutate(group = factor(group, levels = c("BMDMs 5k","BMDMs 1k")))
+
+y_breaks <- c(y_vals_5k, y_vals_1k)
+y_labels <- c(k5k_ord$term, k1k_ord$term)  # 같은 이름 중복 허용
+
+# =========================
+# 라벨 줄바꿈(길면 자동 개행) + 스타일
+# =========================
+wrap_width   <- 36
+y_labels_wrapped <- str_wrap(y_labels, width = wrap_width)
+
+base_size   <- 40  # 전체 글꼴 기본 크기
+axis_y_size <- 40  # y축(경로명) 글자 크게
+axis_x_size <- 45  # x축 눈금
+legend_txt  <- 40
+legend_ttl  <- 40
+max_bubble  <- 26
+
+# =========================
+# Bubble Plot (최종)
+# =========================
+# =========================
+# Bubble Plot (최종) — 업데이트 버전
+# =========================
+p <- ggplot(df_plot, aes(x = neglog10FDR, y = ypos)) +
+  geom_point(
+    aes(fill = group, size = intersection_size),
+    shape = 21, color = "black", alpha = 0.9, stroke = 0.3
+  ) +
+  geom_hline(yintercept = n1 + 0.5, linetype = "dashed", color = "black") +
+  scale_y_continuous(
+    breaks = y_breaks,
+    labels = y_labels_wrapped,
+    expand = c(0.02, 0.02)
+  ) +
+  scale_x_continuous(
+    limits = c(0, xmax),
+    breaks = seq(0, xmax, 1),
+    expand = c(0, 0.02)
+  ) +
+  # 색상은 그대로, 범례 라벨만 5K/1K로 표기
+  scale_fill_manual(
+    values = c("BMDMs 5k" = col_5k, "BMDMs 1k" = col_1k),
+    labels = c("BMDMs 5k" = "BMDMs 5K", "BMDMs 1k" = "BMDMs 1K"),
+    name = NULL
+  ) +
+  # ★ Size 스케일: Counts / 범례는 2,3만 노출 (limits 쓰지 않음)
+  scale_size_area(
+    name = "Counts",
+    max_size = max_bubble,
+    breaks = c(2, 3)
+  ) +
+  labs(y = NULL, x = expression(-log[10]("(FDR)"))) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = base_size, base_family = base_family) +
+  theme(
+    legend.position     = "right",
+    legend.text         = element_text(size = legend_txt),
+    legend.title        = element_text(size = legend_ttl),
+    legend.key.size     = grid::unit(12, "pt"),
+    axis.text.y         = element_text(size = axis_y_size,
+                                       face = "bold",
+                                       colour = "black",   # ← 검정
+                                       lineheight = 0.95),
+    axis.text.x         = element_text(size = axis_x_size, colour = "black"),
+    panel.grid.major.y  = element_blank(),
+    panel.grid.minor    = element_blank(),
+    plot.margin         = margin(t = 10, r = 20, b = 10, l = 40)
+  ) +
+  # 범례 도형: fill 범례(그룹)는 정사각형으로 표시
+  guides(
+    fill = guide_legend(
+      override.aes = list(shape = 22, size = 6, color = "black", stroke = 0.4)
+    )
+  )
+
+print(p)
+
+
+print(p)
+
+# 저장(옵션)
+ggsave("KEGG_bubble_1plot_5k_top_1k_bottom.png", p, width = 7, height = 5, dpi = 300)
+ggsave("KEGG_bubble_1plot_5k_top_1k_bottom.pdf", p, width = 7, height = 5)
+
+
+---
+title: "BMDMs Stemness Statics Analysis Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(stringr)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(readr)
+  library(grid)
+})
+
+# =========================
+# 0) 유틸
+# =========================
+p_to_stars <- function(p) {
+  ifelse(is.na(p), "",
+         ifelse(p < 1e-4, "****",
+                ifelse(p < 1e-3, "***",
+                       ifelse(p < 1e-2, "**",
+                              ifelse(p < 5e-2, "*", "")
+                       )
+                )
+         )
+  )
+}
+
+# =========================
+# 1) 입력/파싱 → dat_long 생성
+# =========================
+excel_path <- "BMDMs_Stemness_Part.xlsx"
+sheet_name <- "Sheet1"
+
+group_means <- c("control", "BMDMs 1k", "BMDMs 5k",
+                 "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+# 행 라벨 자동 선택
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (length(row_label_col) == 0 || is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- dplyr::mutate(df_raw, .endpoint = as.character(.data[[row_label_col]]))
+
+# mean–SD–N 3열 블록 매핑
+cn <- names(df_raw)
+mean_idx <- match(group_means, cn)
+if (any(is.na(mean_idx))) stop("헤더에서 못 찾은 그룹: ", paste(group_means[is.na(mean_idx)], collapse=", "))
+sd_idx <- mean_idx + 1L; n_idx <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) stop("mean, SD, N 순서(3열 블록) 확인 필요")
+
+mean_names <- group_means
+sd_names   <- paste0(group_means, "_sd")
+n_names    <- paste0(group_means, "_n")
+
+long_mean <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(mean_idx)) |>
+  stats::setNames(c(".endpoint", mean_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(sd_idx)) |>
+  stats::setNames(c(".endpoint", sd_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(sd_names), names_to = "group_sd", values_to = "sd") |>
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) |>
+  dplyr::select(-group_sd)
+
+long_n <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(n_idx)) |>
+  stats::setNames(c(".endpoint", n_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(n_names), names_to = "group_n", values_to = "n") |>
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) |>
+  dplyr::select(-group_n)
+
+dat_long <- long_mean |>
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) |>
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) |>
+  dplyr::mutate(
+    mean = suppressWarnings(as.numeric(mean)),
+    sd   = suppressWarnings(as.numeric(sd)),
+    n    = suppressWarnings(as.numeric(n))
+  ) |>
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 2) Heatmap 함수(상단 여백 0, 오른쪽 세로 범례)
+# =========================
+make_heatmap_for <- function(dat_long, baseline, treat_groups) {
+  # --- 검증 ---
+  groups_in_data <- unique(dat_long$group)
+  needed <- unique(c(baseline, treat_groups))
+  missing <- setdiff(needed, groups_in_data)
+  if (length(missing) > 0) stop("데이터에 없는 그룹: ", paste(missing, collapse = ", "))
+  
+  # --- control 요약 ---
+  ctrl_df <- dat_long |>
+    dplyr::filter(group == baseline) |>
+    dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+  
+  # --- Welch + log2FC ---
+  res_list <- lapply(treat_groups, function(g) {
+    dat_long |>
+      dplyr::filter(group == g) |>
+      dplyr::transmute(.endpoint, group, mean_t = mean, sd_t = sd, n_t = n) |>
+      dplyr::left_join(ctrl_df, by = ".endpoint") |>
+      dplyr::mutate(
+        log2FC = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+        se2    = (sd_t^2/n_t) + (sd_c^2/n_c),
+        t_stat = (mean_t - mean_c) / sqrt(se2),
+        df_welch = se2^2 / ( (sd_t^2/n_t)^2 / pmax(n_t - 1, 1) +
+                               (sd_c^2/n_c)^2 / pmax(n_c - 1, 1) ),
+        p_value = 2 * pt(abs(t_stat), df = df_welch, lower.tail = FALSE),
+        contrast = paste0(g, " vs ", baseline)
+      ) |>
+      dplyr::select(.endpoint, contrast, group, mean_c, sd_c, n_c, mean_t, sd_t, n_t,
+                    log2FC, t_stat, df_welch, p_value)
+  })
+  
+  res_all <- dplyr::bind_rows(res_list) |>
+    dplyr::group_by(contrast) |>
+    dplyr::mutate(p_adj = p.adjust(p_value, "BH")) |>
+    dplyr::ungroup() |>
+    dplyr::mutate(stars = p_to_stars(p_value))
+  
+  # --- 행렬 ---
+  col_order_raw <- treat_groups
+  mat_log2fc <- res_all |>
+    dplyr::select(.endpoint, group, log2FC) |>
+    dplyr::mutate(group = factor(group, levels = col_order_raw)) |>
+    tidyr::pivot_wider(names_from = group, values_from = log2FC) |>
+    tibble::column_to_rownames(".endpoint") |>
+    as.matrix()
+  
+  mat_star <- res_all |>
+    dplyr::select(.endpoint, group, stars) |>
+    dplyr::mutate(group = factor(group, levels = col_order_raw)) |>
+    tidyr::pivot_wider(names_from = group, values_from = stars) |>
+    tibble::column_to_rownames(".endpoint") |>
+    as.matrix()
+  
+  # --- 표시용 그룹 라벨 교체: tnfa → TNF-α ---
+  pretty_map <- c("tnfa" = "TNF-α",
+                  "tnfa BMDMs 1k" = "TNF-α + BMDMs 1k",
+                  "tnfa BMDMs 5k" = "TNF-α + BMDMs 5k")
+  rename_cols <- function(v) ifelse(v %in% names(pretty_map), unname(pretty_map[v]), v)
+  colnames(mat_log2fc) <- rename_cols(colnames(mat_log2fc))
+  colnames(mat_star)   <- rename_cols(colnames(mat_star))
+  pretty_order <- rename_cols(col_order_raw)
+  mat_log2fc <- mat_log2fc[, pretty_order, drop = FALSE]
+  mat_star   <- mat_star[,   pretty_order, drop = FALSE]
+  
+  # --- 색 스케일 ---
+  lim <- max(1, stats::quantile(abs(mat_log2fc), 0.95, na.rm = TRUE))
+  col_fun <- circlize::colorRamp2(c(-lim, 0, lim), c("#512DA8", "#f7f7f7", "#F2C94C"))
+  
+  # --- 폰트 폴백(Windows) ---
+  font_family <- if (.Platform$OS.type == "windows") "Arial" else "Helvetica"
+  
+  # --- 라벨 서식 & 공간 예약(잘림 방지) ---
+  rn_gp <- gpar(fontsize = 24, fontfamily = font_family, fontface = "italic")
+  rn_max_w <- ComplexHeatmap::max_text_width(rownames(mat_log2fc), gp = rn_gp) + unit(12, "mm")
+  cn_gp <- gpar(fontsize = 24, fontfamily = font_family)
+  cn_max_h <- ComplexHeatmap::max_text_width(colnames(mat_log2fc), gp = cn_gp) + unit(8, "mm")
+  
+  # --- Heatmap 본체(기본 범례 사용) ---
+  ht <- ComplexHeatmap::Heatmap(
+    mat_log2fc,
+    name = "Log2FC",
+    col = col_fun,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    column_order = match(pretty_order, colnames(mat_log2fc)),
+    na_col = "grey90",
+    rect_gp = gpar(col = "white"),
+    row_names_gp = rn_gp,
+    row_names_max_width = rn_max_w,
+    column_names_gp = cn_gp,
+    column_names_rot = 45,
+    column_names_max_height = cn_max_h,
+    show_heatmap_legend = TRUE,
+    heatmap_legend_param = list(
+      direction      = "vertical",
+      title          = "Log2FC",
+      title_position = "leftcenter-rot",         # 안전하게 세로 제목
+      title_gp       = gpar(fontfamily = font_family, fontface = "bold", fontsize = 18),
+      labels_gp      = gpar(fontfamily = font_family, fontsize = 14),
+      legend_height  = unit(60, "mm"),
+      grid_width     = unit(5, "mm"),
+      grid_height    = unit(3.5, "mm")
+    ),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      lab <- mat_star[i, j]
+      if (!is.na(lab) && nzchar(lab)) {
+        grid.text(lab, x = x, y = y,
+                  gp = gpar(fontsize = 18, fontface = "bold", fontfamily = font_family))
+      }
+    }
+  )
+  
+  # --- 출력: '상단 정렬'로 정확히 붙여 그림 (top 여백 0) ---
+  grid.newpage()
+  vp_top <- viewport(y = unit(1, "npc"), height = unit(1, "npc"),
+                     just = c("center", "top"))
+  pushViewport(vp_top)
+  ComplexHeatmap::draw(
+    ht,
+    newpage = FALSE,                     # ← 우리가 만든 상단 뷰포트 안에 그림
+    merge_legend = TRUE,
+    heatmap_legend_side    = "right",
+    annotation_legend_side = "right",
+    padding = unit(c(20, 20, 2, 8), "mm")  # top=0, right=8, bottom=40, left=36
+  )
+  popViewport()
+  
+  invisible(ht)
+}
+
+# =========================
+# 3) 호출 예
+# =========================
+graphics.off()
+ht_obj <- make_heatmap_for(
+  dat_long     = dat_long,
+  baseline     = "control",
+  treat_groups = c("tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+)
+
+graphics.off()
+ht_obj <- make_heatmap_for(
+  dat_long     = dat_long,
+  baseline     = "control",
+  treat_groups = c("BMDMs 1k", "BMDMs 5k")
+)
+
+
+---
+title: "BMDMs Stemness gProfiler2 Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+############################################################
+# 0. Input 설정
+############################################################
+# setwd("E:/BMDMs Project - Co culture Project 1/9.26 FIgure 통계분석 코드/Only BMDMs/Stemness 분석 V/B. gProfiler Anaylzing")
+
+in_file  <- "BMDMs_Paper_Stemness_Part_t-test_summary.xlsx"  # 엑셀 파일
+organism <- "mmusculus"                                      # 사람 데이터면 "hsapiens"
+sources  <- c("GO:CC", "KEGG")                               # 필요시 "GO:MF","REAC","WP" 등 추가
+
+############################################################
+# 1. 패키지 설치 및 로딩
+############################################################
+req <- c("readxl","readr","dplyr","stringr","purrr","tidyr","ggplot2","gprofiler2")
+inst <- rownames(installed.packages())
+if (length(setdiff(req, inst)) > 0) {
+  install.packages(setdiff(req, inst), repos = "https://cloud.r-project.org")
+}
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(purrr)
+  library(tidyr)
+  library(ggplot2)
+  library(gprofiler2)
+})
+
+# 네임스페이스 단축
+select       <- dplyr::select
+filter       <- dplyr::filter
+mutate       <- dplyr::mutate
+arrange      <- dplyr::arrange
+group_by     <- dplyr::group_by
+ungroup      <- dplyr::ungroup
+pivot_longer <- tidyr::pivot_longer
+pivot_wider  <- tidyr::pivot_wider
+
+############################################################
+# 2. 데이터 읽기 (xlsx / csv 자동 인식)
+############################################################
+if (grepl("\\.xlsx?$", in_file, ignore.case = TRUE)) {
+  dat <- readxl::read_excel(in_file, sheet = 1)
+} else {
+  dat <- readr::read_csv(in_file, show_col_types = FALSE)
+}
+
+cat("=== 입력 데이터 컬럼 이름 ===\n")
+print(names(dat))
+
+############################################################
+# 3. 필수 컬럼 존재 여부 확인
+#    필수: .endpoint, contrast, log2FC, p_adj
+############################################################
+need <- c(".endpoint","contrast","log2FC","p_adj")
+missing <- setdiff(need, names(dat))
+if (length(missing) > 0) {
+  stop("입력 파일에 다음 필수 컬럼이 없습니다: ", paste(missing, collapse=", "))
+}
+
+# 필요 시 rename 예시 (지금은 이미 이름이 맞으므로 패스)
+# dat <- dat %>%
+#   rename(
+#     .endpoint = .endpoint,
+#     contrast  = contrast,
+#     log2FC    = log2FC,
+#     p_adj     = p_adj
+#   )
+
+############################################################
+# 4. 대비(contrast)별로 padj<0.05 & log2FC>0 (유의적 UP) 유전자 리스트 추출
+############################################################
+lists <- dat %>%
+  filter(!is.na(p_adj), !is.na(log2FC)) %>%
+  group_by(contrast) %>%
+  summarise(
+    genes = list(
+      .endpoint[p_adj < 0.05 & log2FC > 0] %>%
+        as.character() %>% stringr::str_trim() %>% unique()
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    n_up_sig = purrr::map_int(genes, length)
+  )
+
+message("대비별 유의적 UP 유전자 수 요약:")
+print(lists %>% select(contrast, n_up_sig))
+
+############################################################
+# 5. 결과 폴더 생성 및 대비별 유전자 리스트 파일 저장
+############################################################
+dir.create("gprofiler_inputs", showWarnings = FALSE)
+dir.create("gprofiler_results", showWarnings = FALSE)
+dir.create("gprofiler_plots",   showWarnings = FALSE)
+
+index <- lists %>%
+  mutate(
+    safe = gsub("[^A-Za-z0-9_\\-]+", "_", contrast),
+    file = file.path("gprofiler_inputs", paste0(safe, "__UP_padj_lt_0.05.txt"))
+  )
+
+# 대비별 gene 리스트 텍스트 파일 (한 줄당 1 gene)
+walk2(index$file, index$genes, ~{
+  writeLines(.y, .x, useBytes = TRUE)
+})
+
+# index 파일 저장
+readr::write_csv(
+  index %>% select(file, contrast, n_up_sig),
+  file.path("gprofiler_inputs", "INDEX_UP_only_lists.csv")
+)
+
+############################################################
+# 6. g:Profiler enrichment (GO:CC + KEGG, UP gene만)
+############################################################
+run_one <- function(genes, tag) {
+  genes <- genes[!is.na(genes) & nzchar(genes)]
+  genes <- unique(genes)
+  if (length(genes) < 3) {
+    message(sprintf("[SKIP] %s — gene count < 3 (n=%d)", tag, length(genes)))
+    return(NULL)
+  }
+  message(sprintf("[g:Profiler] %s (n=%d)", tag, length(genes)))
+  gp <- gprofiler2::gost(
+    query             = genes,
+    organism          = organism,
+    sources           = sources,
+    correction_method = "g_SCS",
+    user_threshold    = 0.05,
+    evcodes           = TRUE
+  )
+  if (is.null(gp) || is.null(gp$result)) {
+    message(sprintf("[WARN] %s — g:Profiler result is NULL", tag))
+    return(NULL)
+  }
+  out <- gp$result %>%
+    arrange(p_value) %>%
+    mutate(tag = tag)
+  out
+}
+
+enr_list <- purrr::pmap(
+  list(lists$genes, lists$contrast),
+  function(gs, ct) run_one(gs, ct)
+)
+
+# NULL 제거 후 병합
+enr <- enr_list %>%
+  purrr::compact() %>%
+  dplyr::bind_rows()
+
+if (!is.null(enr) && nrow(enr) > 0) {
+  out_file <- file.path("gprofiler_results", "enrichment_all_contrasts_GOCC_KEGG.csv")
+  readr::write_csv(enr, out_file)
+  message("저장: ", out_file)
+} else {
+  message("유효한 enrichment 결과가 없습니다. (모든 대비에서 유의한 term 없음 또는 gene count < 3)")
+}
+
+############################################################
+# 7. Bubble Plot 함수 (대비별 + source별 상위 20 term)
+############################################################
+make_bubble <- function(df_contrast, contrast) {
+  if (is.null(df_contrast) || nrow(df_contrast) == 0) return(invisible(NULL))
+  
+  srcs <- sort(unique(df_contrast$source))
+  
+  for (src in srcs) {
+    dsub <- df_contrast %>% dplyr::filter(source == src)
+    if (nrow(dsub) == 0) next
+    
+    dfp <- dsub %>%
+      dplyr::mutate(
+        neglog10p  = -log10(p_value + 1e-300),
+        gene_ratio = ifelse(term_size > 0, intersection_size / term_size, NA_real_)
+      ) %>%
+      dplyr::arrange(dplyr::desc(neglog10p)) %>%
+      dplyr::slice_head(n = 20)
+    
+    if (nrow(dfp) == 0) next
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(x = neglog10p,
+                   y = reorder(term_name, neglog10p))
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = gene_ratio, color = neglog10p),
+        alpha = 0.85
+      ) +
+      ggplot2::scale_size_continuous(name = "Gene ratio", limits = c(0, 1)) +
+      ggplot2::scale_color_gradient(name = "-log10(p)", low = "grey70", high = "red") +
+      ggplot2::labs(
+        title   = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x       = "-log10(p-value)",
+        y       = NULL,
+        caption = "g:Profiler (g_SCS)"
+      ) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(
+        axis.text.y = ggplot2::element_text(size = 10),
+        plot.title  = ggplot2::element_text(face = "bold", size = 13)
+      )
+    
+    fn <- file.path(
+      "gprofiler_plots",
+      paste0(
+        gsub("[^A-Za-z0-9_\\-]+", "_", contrast), "_",
+        gsub(":", "_", src),
+        "_bubble.png"
+      )
+    )
+    
+    ggplot2::ggsave(fn, p, width = 8, height = 6, dpi = 300)
+    message(sprintf("저장: %s", fn))
+  }
+}
+
+############################################################
+# 8. 대비별 bubble plot 생성
+############################################################
+if (!is.null(enr) && nrow(enr) > 0) {
+  enr %>%
+    split(.$tag) %>%
+    purrr::imap(~ make_bubble(.x, .y))
+} else {
+  message("Bubble plot을 생성할 enrichment 결과가 없습니다.")
+}
+
+message("=== g:Profiler + Bubble plot 작업 완료 ===")
+
+
+---
+title: "BMDMs Stemness Volcaonplot Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl);  library(writexl)     # ← 엑셀 저장
+  library(dplyr);   library(stringr);    library(tidyr);  library(purrr)
+  library(ggplot2); library(ggrepel); library(grid)     # ← Volcano
+})
+
+# ========= 공통 설정 =========
+font_family <- if (.Platform$OS.type == "windows") "Arial" else "Helvetica"
+up_col   <- "#F2C94C"
+down_col <- "#512DA8"
+ns_col   <- "grey80"
+
+# =========================
+# 1) 원자료 → long 포맷 (네 기존 로직 그대로)
+# =========================
+excel_path <- "BMDMs_Stemness_Part.xlsx"
+sheet_name <- "Sheet1"
+
+group_means <- c("control", "BMDMs 1k", "BMDMs 5k",
+                 "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (length(row_label_col) == 0 || is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- dplyr::mutate(df_raw, .endpoint = as.character(.data[[row_label_col]]))
+
+cn <- names(df_raw)
+mean_idx <- match(group_means, cn)
+if (any(is.na(mean_idx))) stop("헤더에서 못 찾은 그룹: ", paste(group_means[is.na(mean_idx)], collapse=", "))
+sd_idx <- mean_idx + 1L; n_idx <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) stop("mean, SD, N 순서(3열 블록) 확인 필요")
+
+mean_names <- group_means
+sd_names   <- paste0(group_means, "_sd")
+n_names    <- paste0(group_means, "_n")
+
+long_mean <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(mean_idx)) |>
+  stats::setNames(c(".endpoint", mean_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(sd_idx)) |>
+  stats::setNames(c(".endpoint", sd_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(sd_names), names_to = "group_sd", values_to = "sd") |>
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) |>
+  dplyr::select(-group_sd)
+
+long_n <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(n_idx)) |>
+  stats::setNames(c(".endpoint", n_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(n_names), names_to = "group_n", values_to = "n") |>
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) |>
+  dplyr::select(-group_n)
+
+dat_long <- long_mean |>
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) |>
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) |>
+  dplyr::mutate(
+    mean = suppressWarnings(as.numeric(mean)),
+    sd   = suppressWarnings(as.numeric(sd)),
+    n    = suppressWarnings(as.numeric(n))
+  ) |>
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 2) 통계 요약 함수 (control vs 각 그룹) → log2FC, p, p_adj
+# =========================
+compute_summary <- function(dat_long, baseline, treat_groups) {
+  ctrl_df <- dat_long |>
+    dplyr::filter(group == baseline) |>
+    dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+  
+  out <- purrr::map_dfr(treat_groups, function(g) {
+    dat_long |>
+      dplyr::filter(group == g) |>
+      dplyr::transmute(.endpoint, group, mean_t = mean, sd_t = sd, n_t = n) |>
+      dplyr::left_join(ctrl_df, by = ".endpoint") |>
+      dplyr::mutate(
+        log2FC = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+        se2    = (sd_t^2/n_t) + (sd_c^2/n_c),
+        t_stat = (mean_t - mean_c)/sqrt(se2),
+        df_welch = se2^2 / ( (sd_t^2/n_t)^2/pmax(n_t-1,1) + (sd_c^2/n_c)^2/pmax(n_c-1,1) ),
+        p_value = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE)
+      ) |>
+      dplyr::mutate(baseline = baseline) |>
+      dplyr::select(.endpoint, baseline, group, log2FC, p_value)
+  }) |>
+    dplyr::group_by(group) |>
+    dplyr::mutate(p_adj = p.adjust(p_value, "BH")) |>
+    dplyr::ungroup()
+  
+  # 보기용 그룹명(‘tnfa’ → ‘TNF-α’ 등)
+  pretty_map <- c("tnfa"="TNF-α", "tnfa BMDMs 1k"="TNF-α + BMDMs 1k", "tnfa BMDMs 5k"="TNF-α + BMDMs 5k")
+  out$group_pretty <- ifelse(out$group %in% names(pretty_map), unname(pretty_map[out$group]), out$group)
+  out
+}
+
+treat_groups <- c("BMDMs 1k", "BMDMs 5k", "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+summary_all <- compute_summary(dat_long, baseline = "control", treat_groups = treat_groups)
+
+# =========================
+# 3) 엑셀로 저장 (시트 5개)
+# =========================
+# 각 그룹별 테이블을 list로 만들어 write_xlsx에 넘긴다
+tbl_list <- split(summary_all, summary_all$group_pretty) |>
+  purrr::map(\(df) dplyr::select(df,
+                                 .endpoint, baseline,
+                                 group = group_pretty,
+                                 log2FC, p_value, p_adj))
+out_xlsx <- "Volcano_input_summary.xlsx"
+writexl::write_xlsx(tbl_list, path = out_xlsx)
+message("Saved: ", normalizePath(out_xlsx))
+
+# =========================
+# 4) (재현) 엑셀에서 읽어 Volcano plot 생성
+# =========================
+volcano_from_excel <- function(xlsx_path,
+                               p_use = c("adj","raw"),
+                               p_thresh = 0.05,
+                               fc_thresh = log2(1.5)) {
+  p_use <- match.arg(p_use)
+  sheets <- readxl::excel_sheets(xlsx_path)
+  df_list <- lapply(sheets, function(s) readxl::read_excel(xlsx_path, sheet = s))
+  df_all  <- dplyr::bind_rows(df_list, .id = "sheet_id")
+  names(df_all)[names(df_all)=="group"] <- "group_pretty"
+  
+  # 전역 축 범위
+  x_lim <- max(abs(df_all$log2FC), na.rm = TRUE)
+  x_lim <- max(x_lim, fc_thresh)
+  xlim_all <- c(-x_lim, x_lim)
+  
+  pcol <- if (p_use == "adj") "p_adj" else "p_value"
+  df_all[[pcol]] <- pmax(df_all[[pcol]], 1e-300)
+  y_lim <- max(-log10(df_all[[pcol]]), na.rm = TRUE)
+  y_lim <- max(y_lim, -log10(p_thresh) + 0.5)
+  ylim_all <- c(0, y_lim)
+  # 전역 축 범위 (원래 계산하던 코드 그대로 두어도 됨)
+  x_lim <- max(abs(df_all$log2FC), na.rm = TRUE)
+  x_lim <- max(x_lim, fc_thresh)
+  xlim_all <- c(-x_lim, x_lim)
+  
+  pcol <- if (p_use == "adj") "p_adj" else "p_value"
+  df_all[[pcol]] <- pmax(df_all[[pcol]], 1e-300)
+  y_lim <- max(-log10(df_all[[pcol]]), na.rm = TRUE)
+  y_lim <- max(y_lim, -log10(p_thresh) + 0.5)
+  ylim_all <- c(0, y_lim)
+  
+  # ===== 여기서 ‘강제 고정’ 덮어쓰기 =====
+  xlim_all <- c(-6, 6)
+  ylim_all <- c(0, 5)
+  # ====================================
+  mk_one <- function(df1) {
+    df1 <- df1 |>
+      mutate(p_show = if (p_use=="adj") p_adj else p_value,
+             p_show = pmax(p_show, 1e-300),
+             neglog10 = -log10(p_show),
+             status = case_when(
+               p_show < p_thresh & log2FC >=  fc_thresh ~ "Up",
+               p_show < p_thresh & log2FC <= -fc_thresh ~ "Down",
+               TRUE ~ "NS"
+             ))
+    ggplot(df1, aes(x = log2FC, y = neglog10)) +
+      geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_vline(xintercept = c(-fc_thresh, fc_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_point(aes(color = status), size = 2.2, alpha = 0.9) +
+      scale_color_manual(values = c("Down"=down_col, "NS"=ns_col, "Up"=up_col),
+                         breaks = c("Down","NS","Up")) +
+      coord_cartesian(xlim = xlim_all, ylim = ylim_all, expand = FALSE) +
+      labs(
+        title = unique(df1$group_pretty),
+        x = "log2(Fold Change)",
+        y = if (p_use=="adj") expression(-log[10]("BH-adjusted p")) else expression(-log[10](p))
+      ) +
+      theme_bw(base_family = font_family) +
+      theme(
+        plot.title = element_text(face = "bold", size =35, hjust = 0.5),
+        axis.title = element_text(size =30, color = "black"),
+        axis.text  = element_text(size =30, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(2, 6, 2, 6, unit = "mm")
+      ) +
+      ggrepel::geom_text_repel(
+        data = df1 %>% filter(status != "NS"),
+        aes(label = .endpoint),
+        size = 10, family = font_family, fontface = "italic",
+        max.overlaps = 30, box.padding = 0.25, point.padding = 0.2,
+        min.segment.length = 0, seed = 123
+      )
+  }
+  
+  plots <- df_all %>% group_split(group_pretty) %>% purrr::map(mk_one)
+  names(plots) <- unique(df_all$group_pretty)
+  list(plots = plots, xlim = xlim_all, ylim = ylim_all)
+}
+
+# 실행: 엑셀에서 읽어 Volcano 그리기
+res <- volcano_from_excel(out_xlsx, p_use = "adj", p_thresh = 0.05, fc_thresh = log2(1.5))
+graphics.off()
+invisible(lapply(res$plots, print))
+
+# (선택) 저장
+# dir.create("volcano_out", FALSE)
+# purrr::iwalk(res$plots, ~ ggsave(file.path("volcano_out", paste0("Volcano_", .y, ".png")),
+#                                  plot = .x, width = 5, height = 4, dpi = 300))
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl);  library(writexl)     # ← 엑셀 저장
+  library(dplyr);   library(stringr);    library(tidyr);  library(purrr)
+  library(ggplot2); library(ggrepel);    library(grid)    # ← Volcano
+})
+
+# ========= 공통 설정 =========
+font_family <- if (.Platform$OS.type == "windows") "Arial" else "Helvetica"
+up_col   <- "#F2C94C"
+down_col <- "#512DA8"
+ns_col   <- "grey80"
+
+# =========================
+# 1) 원자료 → long 포맷
+# =========================
+excel_path <- "BMDMs_Stemness_Part.xlsx"
+sheet_name <- "Sheet1"
+
+group_means <- c("control", "BMDMs 1k", "BMDMs 5k",
+                 "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (length(row_label_col) == 0 || is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- dplyr::mutate(df_raw, .endpoint = as.character(.data[[row_label_col]]))
+
+cn <- names(df_raw)
+mean_idx <- match(group_means, cn)
+if (any(is.na(mean_idx))) stop("헤더에서 못 찾은 그룹: ", paste(group_means[is.na(mean_idx)], collapse=", "))
+sd_idx <- mean_idx + 1L; n_idx <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) stop("mean, SD, N 순서(3열 블록) 확인 필요")
+
+mean_names <- group_means
+sd_names   <- paste0(group_means, "_sd")
+n_names    <- paste0(group_means, "_n")
+
+long_mean <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(mean_idx)) |>
+  stats::setNames(c(".endpoint", mean_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(sd_idx)) |>
+  stats::setNames(c(".endpoint", sd_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(sd_names), names_to = "group_sd", values_to = "sd") |>
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) |>
+  dplyr::select(-group_sd)
+
+long_n <- df_raw |>
+  dplyr::select(.endpoint, dplyr::all_of(n_idx)) |>
+  stats::setNames(c(".endpoint", n_names)) |>
+  tidyr::pivot_longer(dplyr::all_of(n_names), names_to = "group_n", values_to = "n") |>
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) |>
+  dplyr::select(-group_n)
+
+dat_long <- long_mean |>
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) |>
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) |>
+  dplyr::mutate(
+    mean = suppressWarnings(as.numeric(mean)),
+    sd   = suppressWarnings(as.numeric(sd)),
+    n    = suppressWarnings(as.numeric(n))
+  ) |>
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 2) 통계 요약 (control vs 각 그룹) → log2FC, p(raw), p_adj
+# =========================
+compute_summary <- function(dat_long, baseline, treat_groups) {
+  ctrl_df <- dat_long |>
+    dplyr::filter(group == baseline) |>
+    dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+  
+  out <- purrr::map_dfr(treat_groups, function(g) {
+    dat_long |>
+      dplyr::filter(group == g) |>
+      dplyr::transmute(.endpoint, group, mean_t = mean, sd_t = sd, n_t = n) |>
+      dplyr::left_join(ctrl_df, by = ".endpoint") |>
+      dplyr::mutate(
+        log2FC = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+        se2    = (sd_t^2/n_t) + (sd_c^2/n_c),
+        t_stat = (mean_t - mean_c)/sqrt(se2),
+        df_welch = se2^2 / ( (sd_t^2/n_t)^2/pmax(n_t-1,1) + (sd_c^2/n_c)^2/pmax(n_c-1,1) ),
+        p_value = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE)
+      ) |>
+      dplyr::mutate(baseline = baseline) |>
+      dplyr::select(.endpoint, baseline, group, log2FC, p_value)
+  }) |>
+    dplyr::group_by(group) |>
+    dplyr::mutate(p_adj = p.adjust(p_value, "BH")) |>
+    dplyr::ungroup()
+  
+  # 보기용 그룹명(‘tnfa’ → ‘TNF-α’ 등)
+  pretty_map <- c("tnfa"="TNF-α", "tnfa BMDMs 1k"="TNF-α + BMDMs 1k", "tnfa BMDMs 5k"="TNF-α + BMDMs 5k")
+  out$group_pretty <- ifelse(out$group %in% names(pretty_map), unname(pretty_map[out$group]), out$group)
+  out
+}
+
+treat_groups <- c("BMDMs 1k", "BMDMs 5k", "tnfa", "tnfa BMDMs 1k", "tnfa BMDMs 5k")
+summary_all <- compute_summary(dat_long, baseline = "control", treat_groups = treat_groups)
+
+# =========================
+# 3) 엑셀로 저장 (시트 5개)
+# =========================
+tbl_list <- split(summary_all, summary_all$group_pretty) |>
+  purrr::map(\(df) dplyr::select(df,
+                                 .endpoint, baseline,
+                                 group = group_pretty,
+                                 log2FC, p_value, p_adj))
+out_xlsx <- "Volcano_input_summary.xlsx"
+writexl::write_xlsx(tbl_list, path = out_xlsx)
+message("Saved: ", normalizePath(out_xlsx))
+
+# =========================
+# 4) 엑셀에서 읽어 Volcano plot 생성
+#     └ 기본: raw p 사용(= y축 −log10(p-value))
+# =========================
+volcano_from_excel <- function(xlsx_path,
+                               p_use = c("raw","adj"),   # ← 기본을 raw로 고정
+                               p_thresh = 0.05,
+                               fc_thresh = log2(1.5)) {
+  p_use <- match.arg(p_use)
+  sheets  <- readxl::excel_sheets(xlsx_path)
+  df_list <- lapply(sheets, function(s) readxl::read_excel(xlsx_path, sheet = s))
+  df_all  <- dplyr::bind_rows(df_list, .id = "sheet_id")
+  names(df_all)[names(df_all)=="group"] <- "group_pretty"
+  
+  # 전역 축 범위 계산
+  x_lim <- max(abs(df_all$log2FC), na.rm = TRUE)
+  x_lim <- max(x_lim, fc_thresh)
+  xlim_all <- c(-x_lim, x_lim)
+  
+  pcol <- if (p_use == "adj") "p_adj" else "p_value"
+  df_all[[pcol]] <- pmax(df_all[[pcol]], 1e-300)
+  y_lim <- max(-log10(df_all[[pcol]]), na.rm = TRUE)
+  y_lim <- max(y_lim, -log10(p_thresh) + 0.5)
+  ylim_all <- c(0, y_lim)
+  
+  # ===== 필요시 강제 고정(유지) =====
+  xlim_all <- c(-6, 6)
+  ylim_all <- c(0, 6)
+  # =================================
+  
+  mk_one <- function(df1) {
+    df1 <- df1 |>
+      dplyr::mutate(
+        p_show = if (p_use=="adj") p_adj else p_value,
+        p_show = pmax(p_show, 1e-300),
+        neglog10 = -log10(p_show),
+        status = dplyr::case_when(
+          p_show < p_thresh & log2FC >=  fc_thresh ~ "Up",
+          p_show < p_thresh & log2FC <= -fc_thresh ~ "Down",
+          TRUE ~ "NS"
+        )
+      )
+    ggplot(df1, aes(x = log2FC, y = neglog10)) +
+      geom_hline(yintercept = -log10(p_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_vline(xintercept = c(-fc_thresh, fc_thresh), linetype = "dashed", size = 0.4, color = "grey50") +
+      geom_point(aes(color = status), size = 2.2, alpha = 0.9) +
+      scale_color_manual(values = c("Down"=down_col, "NS"=ns_col, "Up"=up_col),
+                         breaks = c("Down","NS","Up")) +
+      coord_cartesian(xlim = xlim_all, ylim = ylim_all, expand = FALSE) +
+      labs(
+        title = unique(df1$group_pretty),
+        x = "log2(Fold Change)",
+        y = if (p_use=="adj")
+          expression(-log[10]("BH-adjusted p"))
+        else
+          expression(-log[10]("p-value"))   # ← 명시적 표기
+      ) +
+      theme_bw(base_family = font_family) +
+      theme(
+        plot.title = element_text(face = "bold", size = 35, hjust = 0.5),
+        axis.title = element_text(size = 30, color = "black"),
+        axis.text  = element_text(size = 30, color = "black"),
+        legend.position = "none",
+        plot.margin = margin(2, 6, 2, 6, unit = "mm")
+      ) +
+      ggrepel::geom_text_repel(
+        data = dplyr::filter(df1, status != "NS"),
+        aes(label = .endpoint),
+        size = 10, family = font_family, fontface = "italic",
+        max.overlaps = 30, box.padding = 0.25, point.padding = 0.2,
+        min.segment.length = 0, seed = 123
+      )
+  }
+  
+  plots <- df_all %>% dplyr::group_split(group_pretty) %>% purrr::map(mk_one)
+  names(plots) <- unique(df_all$group_pretty)
+  list(plots = plots, xlim = xlim_all, ylim = ylim_all)
+}
+
+# =========================
+# 실행: y축 = −log10(raw p-value)
+# =========================
+res <- volcano_from_excel(out_xlsx, p_use = "raw", p_thresh = 0.05, fc_thresh = log2(1.5))
+graphics.off()
+invisible(lapply(res$plots, print))
+
+# (선택) 저장
+dir.create("volcano_out", FALSE)
+purrr::iwalk(res$plots, ~ ggsave(file.path("volcano_out", paste0("Volcano_", .y, ".png")),
+                                 plot = .x, width = 9, height = 7, dpi = 300))

@@ -1,0 +1,2500 @@
+---
+title: "BMDMs + TNF alpha Stemness Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(stringr)
+  library(tidyr);  library(tibble); library(readr)
+  library(ComplexHeatmap); library(circlize); library(grid)
+})
+
+# === tidyverse 동사 고정(마스킹 방지용은 네임스페이스로 해결하므로 선택사항) ===
+`%>%` <- magrittr::`%>%`
+
+
+# 별표(★ raw p-value)
+p_to_stars <- function(p){
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "***",
+                ifelse(p < 0.01,  "**",
+                       ifelse(p < 0.05, "*", ""))))
+}
+
+# =========================
+# 1) 데이터 읽기 + 행 라벨(.endpoint)
+# =========================
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+# 행 라벨 열 자동 선택(필요시 명시적으로 row_label_col <- "GENE" 등)
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- df_raw %>% dplyr::mutate(.endpoint = as.character(.data[[row_label_col]]))
+
+# =========================
+# 2) 헤더 탐지 — 접미사 '...숫자' 및 공백/대소문자/α 허용
+#    가정: 각 mean 오른쪽 두 칸이 SD, N (mean–SD–N 3열 블록)
+# =========================
+cn_raw <- names(df_raw)
+
+norm_for_match <- function(x){
+  x %>%
+    stringr::str_replace_all("\u00A0", " ") %>%     # NBSP -> space
+    stringr::str_replace_all("\\s+", " ") %>%       # 다중 공백 정리
+    stringr::str_squish() %>%
+    stringr::str_replace("\\.\\.\\.\\d+$", "") %>%  # readxl 접미사 제거
+    stringr::str_to_lower()
+}
+cn_norm <- norm_for_match(cn_raw)
+
+find_all <- function(pat){
+  which(stringr::str_detect(cn_norm, stringr::regex(pat, ignore_case = TRUE)))
+}
+
+# 패턴(대소문자/α, BMDM/BMDMs, 1k/5k 모두 허용)
+p_ctrl <- "^control$"
+p_tnfa <- "^tnf[aα]$"
+p_1k   <- "^tnf[aα]\\s*bmdm[s]?\\s*1k$"
+p_5k   <- "^tnf[aα]\\s*bmdm[s]?\\s*5k$"
+
+idx_control <- find_all(p_ctrl)
+idx_tnfa    <- find_all(p_tnfa)
+idx_1k_all  <- find_all(p_1k)
+idx_5k_all  <- find_all(p_5k)
+
+if (length(idx_control) < 1) stop("헤더 'control'을 찾지 못했습니다. 현재 헤더:\n", paste(cn_raw, collapse=" | "))
+if (length(idx_tnfa)    < 1) stop("헤더 'tnfa'를 찾지 못했습니다. 현재 헤더:\n", paste(cn_raw, collapse=" | "))
+
+# 1K/5K 결정 로직
+if (length(idx_5k_all) >= 1) {
+  idx_5k <- idx_5k_all[1]
+} else if (length(idx_1k_all) >= 2) {
+  idx_5k <- idx_1k_all[2]
+  message(sprintf("참고: 'tnfa BMDMs 5K' 열이 없어 'tnfa BMDMs 1k'의 두 번째 발생(%s열, 원래명 '%s')을 5K로 간주합니다.",
+                  idx_5k, cn_raw[idx_5k]))
+} else {
+  stop("5K 열을 찾지 못했습니다. (명시적 'tnfa BMDMs 5K'가 없고, 'tnfa BMDMs 1k'가 2회 등장하지 않습니다)")
+}
+if (length(idx_1k_all) >= 1) {
+  idx_1k <- idx_1k_all[1]
+} else {
+  stop("1K 열을 찾지 못했습니다. 현재 헤더:\n", paste(cn_raw, collapse=" | "))
+}
+
+control_idx <- idx_control[1]
+tnfa_idx    <- idx_tnfa[1]
+
+mean_idx <- c(control_idx, tnfa_idx, idx_1k, idx_5k)
+sd_idx   <- mean_idx + 1L
+n_idx    <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) {
+  stop("SD/N 열 인덱스가 범위를 벗어납니다. (mean–SD–N 3열 블록 구조인지 확인)")
+}
+
+# 내부 안전 이름(중복 회피) — 표시 라벨은 아래에서 지정
+mean_names <- c("control", "tnfa", "tnfa_BMDMs_1K", "tnfa_BMDMs_5K")
+sd_names   <- paste0(mean_names, "_sd")
+n_names    <- paste0(mean_names, "_n")
+
+# =========================
+# 3) long 포맷 (mean/sd/n)
+# =========================
+long_mean <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(mean_idx)) %>%
+  `colnames<-`(c(".endpoint", mean_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(sd_idx)) %>%
+  `colnames<-`(c(".endpoint", sd_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(sd_names), names_to = "group_sd", values_to = "sd") %>%
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) %>%
+  dplyr::select(-group_sd)
+
+long_n <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(n_idx)) %>%
+  `colnames<-`(c(".endpoint", n_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(n_names), names_to = "group_n", values_to = "n") %>%
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) %>%
+  dplyr::select(-group_n)
+
+dat_long <- long_mean %>%
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) %>%
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) %>%
+  dplyr::mutate(dplyr::across(c(mean, sd, n), ~ suppressWarnings(as.numeric(.)))) %>%
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 4) Control 대비 Welch t-test + log2FC
+# =========================
+control_name <- "control"
+treat_groups <- c("tnfa", "tnfa_BMDMs_1K", "tnfa_BMDMs_5K")  # 열 순서: tnfa → 1K → 5K
+
+if (!(control_name %in% dat_long$group)) stop("control 열을 찾지 못했습니다.")
+
+ctrl_df <- dat_long %>%
+  dplyr::filter(group == control_name) %>%
+  dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+
+res_all <- lapply(treat_groups, function(g){
+  dat_long %>%
+    dplyr::filter(group == g) %>%
+    dplyr::transmute(.endpoint, group = g,
+                     mean_t = mean, sd_t = sd, n_t = n) %>%
+    dplyr::left_join(ctrl_df, by = ".endpoint") %>%
+    dplyr::mutate(
+      log2FC   = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+      se2      = (sd_t^2/n_t) + (sd_c^2/n_c),
+      t_stat   = (mean_t - mean_c)/sqrt(se2),
+      df_welch = se2^2 / ( (sd_t^2/n_t)^2/(pmax(n_t-1,1)+1e-12) +
+                             (sd_c^2/n_c)^2/(pmax(n_c-1,1)+1e-12) ),
+      p_value  = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE),
+      contrast = paste0(g, " vs control")
+    ) %>%
+    dplyr::select(.endpoint, contrast, group, mean_c, sd_c, n_c, mean_t, sd_t, n_t,
+                  log2FC, t_stat, df_welch, p_value)
+}) %>% dplyr::bind_rows() %>%
+  dplyr::group_by(contrast) %>%
+  dplyr::mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(stars = p_to_stars(p_value))
+
+# =========================
+# 5) Heatmap (log2FC + 별표)
+# =========================
+# (tibble::column_to_rownames 대신 base R로 안전 변환)
+to_matrix <- function(df, key, value_col_names){
+  df2 <- df %>% dplyr::select(tidyselect::all_of(c(key, value_col_names)))
+  rn <- df2[[key]]
+  mat <- as.matrix(df2[ , value_col_names, drop = FALSE])
+  rownames(mat) <- rn
+  mat
+}
+
+mat_log2fc <- res_all %>%
+  dplyr::select(.endpoint, group, log2FC) %>%
+  dplyr::mutate(group = factor(group, levels = treat_groups)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = log2FC) %>%
+  {\(.) to_matrix(., key = ".endpoint", value_col_names = levels(.$group)[!is.na(levels(.$group))]) }()
+
+# 위에서 levels 사용이 까다로울 수 있으니 명시적으로:
+mat_log2fc <- res_all %>%
+  dplyr::select(.endpoint, group, log2FC) %>%
+  dplyr::mutate(group = factor(group, levels = treat_groups)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = log2FC) %>%
+  {\(.) {
+    val_cols <- setdiff(colnames(.), ".endpoint")
+    rn <- .$.endpoint
+    mat <- as.matrix(.[, val_cols, drop = FALSE])
+    rownames(mat) <- rn
+    mat
+  }}()
+
+mat_star <- res_all %>%
+  dplyr::select(.endpoint, group, stars) %>%
+  dplyr::mutate(group = factor(group, levels = treat_groups)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = stars) %>%
+  {\(.) {
+    val_cols <- setdiff(colnames(.), ".endpoint")
+    rn <- .$.endpoint
+    mat <- as.matrix(.[, val_cols, drop = FALSE])
+    rownames(mat) <- rn
+    mat
+  }}()
+
+lim <- max(1, stats::quantile(abs(mat_log2fc), 0.95, na.rm = TRUE))
+col_fun <- circlize::colorRamp2(c(-lim, 0, lim), c("#3b4cc0", "#f7f7f7", "#b40426"))
+
+ht <- ComplexHeatmap::Heatmap(
+  mat_log2fc,
+  name = "log2(FC) vs control",
+  col  = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_order  = treat_groups,  # tnfa → 1K → 5K
+  na_col = "grey90",
+  rect_gp = grid::gpar(col = "white"),
+  row_names_gp = grid::gpar(fontsize = 11),
+  column_names_gp = grid::gpar(fontsize = 11,
+                               labels = c("tnfa", "tnfa BMDMs 1K", "tnfa BMDMs 5K")),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    lab <- mat_star[i, j]
+    if (!is.na(lab) && nzchar(lab)) {
+      grid::grid.text(lab, x = x, y = y, gp = grid::gpar(fontsize = 12, fontface = "bold"))
+    }
+  }
+)
+ComplexHeatmap::draw(ht)  # 현재 plotting device로 바로 출력(파일 저장 X)
+
+# =========================
+# 6) 요약 저장
+# =========================
+out_tbl <- res_all %>%
+  dplyr::arrange(.endpoint, match(group, treat_groups)) %>%
+  dplyr::select(.endpoint, contrast,
+                mean_c, sd_c, n_c, mean_t, sd_t, n_t,
+                log2FC, t_stat, df_welch, p_value, p_adj, stars)
+
+readr::write_csv(out_tbl, "Control_vs_tnfa_1K_5K_log2FC_ttest_rawP_FDR.csv")
+message("완료: Control 대비(tnfa, 1K, 5K) heatmap + 요약 CSV 저장")
+
+
+---
+title: "BMDMs + TNF alpha Stemness Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# =========================
+# Packages
+# =========================
+suppressPackageStartupMessages({
+  library(readxl); library(dplyr); library(stringr)
+  library(tidyr);  library(tibble); library(readr)
+  library(ComplexHeatmap); library(circlize); library(grid)
+})
+
+# === tidyverse 동사 고정(마스킹 방지용은 네임스페이스로 해결하므로 선택사항) ===
+`%>%` <- magrittr::`%>%`
+
+
+# 별표(★ raw p-value)
+p_to_stars <- function(p){
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "***",
+                ifelse(p < 0.01,  "**",
+                       ifelse(p < 0.05, "*", ""))))
+}
+
+# =========================
+# 1) 데이터 읽기 + 행 라벨(.endpoint)
+# =========================
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+# 행 라벨 열 자동 선택(필요시 명시적으로 row_label_col <- "GENE" 등)
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[ which.max(colSums(!is.na(df_raw[candidate_label_cols])) ) ]
+if (is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+df_raw <- df_raw %>% dplyr::mutate(.endpoint = as.character(.data[[row_label_col]]))
+
+# =========================
+# 2) 헤더 탐지 — 접미사 '...숫자' 및 공백/대소문자/α 허용
+#    가정: 각 mean 오른쪽 두 칸이 SD, N (mean–SD–N 3열 블록)
+# =========================
+cn_raw <- names(df_raw)
+
+norm_for_match <- function(x){
+  x %>%
+    stringr::str_replace_all("\u00A0", " ") %>%     # NBSP -> space
+    stringr::str_replace_all("\\s+", " ") %>%       # 다중 공백 정리
+    stringr::str_squish() %>%
+    stringr::str_replace("\\.\\.\\.\\d+$", "") %>%  # readxl 접미사 제거
+    stringr::str_to_lower()
+}
+cn_norm <- norm_for_match(cn_raw)
+
+find_all <- function(pat){
+  which(stringr::str_detect(cn_norm, stringr::regex(pat, ignore_case = TRUE)))
+}
+
+# 패턴(대소문자/α, BMDM/BMDMs, 1k/5k 모두 허용)
+p_ctrl <- "^control$"
+p_tnfa <- "^tnf[aα]$"
+p_1k   <- "^tnf[aα]\\s*bmdm[s]?\\s*1k$"
+p_5k   <- "^tnf[aα]\\s*bmdm[s]?\\s*5k$"
+
+idx_control <- find_all(p_ctrl)
+idx_tnfa    <- find_all(p_tnfa)
+idx_1k_all  <- find_all(p_1k)
+idx_5k_all  <- find_all(p_5k)
+
+if (length(idx_control) < 1) stop("헤더 'control'을 찾지 못했습니다. 현재 헤더:\n", paste(cn_raw, collapse=" | "))
+if (length(idx_tnfa)    < 1) stop("헤더 'tnfa'를 찾지 못했습니다. 현재 헤더:\n", paste(cn_raw, collapse=" | "))
+
+# 1K/5K 결정 로직
+if (length(idx_5k_all) >= 1) {
+  idx_5k <- idx_5k_all[1]
+} else if (length(idx_1k_all) >= 2) {
+  idx_5k <- idx_1k_all[2]
+  message(sprintf("참고: 'tnfa BMDMs 5K' 열이 없어 'tnfa BMDMs 1k'의 두 번째 발생(%s열, 원래명 '%s')을 5K로 간주합니다.",
+                  idx_5k, cn_raw[idx_5k]))
+} else {
+  stop("5K 열을 찾지 못했습니다. (명시적 'tnfa BMDMs 5K'가 없고, 'tnfa BMDMs 1k'가 2회 등장하지 않습니다)")
+}
+if (length(idx_1k_all) >= 1) {
+  idx_1k <- idx_1k_all[1]
+} else {
+  stop("1K 열을 찾지 못했습니다. 현재 헤더:\n", paste(cn_raw, collapse=" | "))
+}
+
+control_idx <- idx_control[1]
+tnfa_idx    <- idx_tnfa[1]
+
+mean_idx <- c(control_idx, tnfa_idx, idx_1k, idx_5k)
+sd_idx   <- mean_idx + 1L
+n_idx    <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) {
+  stop("SD/N 열 인덱스가 범위를 벗어납니다. (mean–SD–N 3열 블록 구조인지 확인)")
+}
+
+# 내부 안전 이름(중복 회피) — 표시 라벨은 아래에서 지정
+mean_names <- c("control", "tnfa", "tnfa_BMDMs_1K", "tnfa_BMDMs_5K")
+sd_names   <- paste0(mean_names, "_sd")
+n_names    <- paste0(mean_names, "_n")
+
+# =========================
+# 3) long 포맷 (mean/sd/n)
+# =========================
+long_mean <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(mean_idx)) %>%
+  `colnames<-`(c(".endpoint", mean_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(mean_names), names_to = "group", values_to = "mean")
+
+long_sd <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(sd_idx)) %>%
+  `colnames<-`(c(".endpoint", sd_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(sd_names), names_to = "group_sd", values_to = "sd") %>%
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) %>%
+  dplyr::select(-group_sd)
+
+long_n <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(n_idx)) %>%
+  `colnames<-`(c(".endpoint", n_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(n_names), names_to = "group_n", values_to = "n") %>%
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) %>%
+  dplyr::select(-group_n)
+
+dat_long <- long_mean %>%
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) %>%
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) %>%
+  dplyr::mutate(dplyr::across(c(mean, sd, n), ~ suppressWarnings(as.numeric(.)))) %>%
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# =========================
+# 4) Control 대비 Welch t-test + log2FC
+# =========================
+control_name <- "control"
+treat_groups <- c("tnfa", "tnfa_BMDMs_1K", "tnfa_BMDMs_5K")  # 열 순서: tnfa → 1K → 5K
+
+if (!(control_name %in% dat_long$group)) stop("control 열을 찾지 못했습니다.")
+
+ctrl_df <- dat_long %>%
+  dplyr::filter(group == control_name) %>%
+  dplyr::transmute(.endpoint, mean_c = mean, sd_c = sd, n_c = n)
+
+res_all <- lapply(treat_groups, function(g){
+  dat_long %>%
+    dplyr::filter(group == g) %>%
+    dplyr::transmute(.endpoint, group = g,
+                     mean_t = mean, sd_t = sd, n_t = n) %>%
+    dplyr::left_join(ctrl_df, by = ".endpoint") %>%
+    dplyr::mutate(
+      log2FC   = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+      se2      = (sd_t^2/n_t) + (sd_c^2/n_c),
+      t_stat   = (mean_t - mean_c)/sqrt(se2),
+      df_welch = se2^2 / ( (sd_t^2/n_t)^2/(pmax(n_t-1,1)+1e-12) +
+                             (sd_c^2/n_c)^2/(pmax(n_c-1,1)+1e-12) ),
+      p_value  = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE),
+      contrast = paste0(g, " vs control")
+    ) %>%
+    dplyr::select(.endpoint, contrast, group, mean_c, sd_c, n_c, mean_t, sd_t, n_t,
+                  log2FC, t_stat, df_welch, p_value)
+}) %>% dplyr::bind_rows() %>%
+  dplyr::group_by(contrast) %>%
+  dplyr::mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(stars = p_to_stars(p_value))
+
+# =========================
+# 5) Heatmap (log2FC + 별표)
+# =========================
+# (tibble::column_to_rownames 대신 base R로 안전 변환)
+to_matrix <- function(df, key, value_col_names){
+  df2 <- df %>% dplyr::select(tidyselect::all_of(c(key, value_col_names)))
+  rn <- df2[[key]]
+  mat <- as.matrix(df2[ , value_col_names, drop = FALSE])
+  rownames(mat) <- rn
+  mat
+}
+
+mat_log2fc <- res_all %>%
+  dplyr::select(.endpoint, group, log2FC) %>%
+  dplyr::mutate(group = factor(group, levels = treat_groups)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = log2FC) %>%
+  {\(.) to_matrix(., key = ".endpoint", value_col_names = levels(.$group)[!is.na(levels(.$group))]) }()
+
+# 위에서 levels 사용이 까다로울 수 있으니 명시적으로:
+mat_log2fc <- res_all %>%
+  dplyr::select(.endpoint, group, log2FC) %>%
+  dplyr::mutate(group = factor(group, levels = treat_groups)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = log2FC) %>%
+  {\(.) {
+    val_cols <- setdiff(colnames(.), ".endpoint")
+    rn <- .$.endpoint
+    mat <- as.matrix(.[, val_cols, drop = FALSE])
+    rownames(mat) <- rn
+    mat
+  }}()
+
+mat_star <- res_all %>%
+  dplyr::select(.endpoint, group, stars) %>%
+  dplyr::mutate(group = factor(group, levels = treat_groups)) %>%
+  tidyr::pivot_wider(names_from = group, values_from = stars) %>%
+  {\(.) {
+    val_cols <- setdiff(colnames(.), ".endpoint")
+    rn <- .$.endpoint
+    mat <- as.matrix(.[, val_cols, drop = FALSE])
+    rownames(mat) <- rn
+    mat
+  }}()
+
+lim <- max(1, stats::quantile(abs(mat_log2fc), 0.95, na.rm = TRUE))
+col_fun <- circlize::colorRamp2(c(-lim, 0, lim), c("#3b4cc0", "#f7f7f7", "#b40426"))
+
+ht <- ComplexHeatmap::Heatmap(
+  mat_log2fc,
+  name = "log2(FC) vs control",
+  col  = col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_order  = treat_groups,  # tnfa → 1K → 5K
+  na_col = "grey90",
+  rect_gp = grid::gpar(col = "white"),
+  row_names_gp = grid::gpar(fontsize = 11),
+  column_names_gp = grid::gpar(fontsize = 11,
+                               labels = c("tnfa", "tnfa BMDMs 1K", "tnfa BMDMs 5K")),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    lab <- mat_star[i, j]
+    if (!is.na(lab) && nzchar(lab)) {
+      grid::grid.text(lab, x = x, y = y, gp = grid::gpar(fontsize = 12, fontface = "bold"))
+    }
+  }
+)
+ComplexHeatmap::draw(ht)  # 현재 plotting device로 바로 출력(파일 저장 X)
+
+# =========================
+# 6) 요약 저장
+# =========================
+out_tbl <- res_all %>%
+  dplyr::arrange(.endpoint, match(group, treat_groups)) %>%
+  dplyr::select(.endpoint, contrast,
+                mean_c, sd_c, n_c, mean_t, sd_t, n_t,
+                log2FC, t_stat, df_welch, p_value, p_adj, stars)
+
+readr::write_csv(out_tbl, "Control_vs_tnfa_1K_5K_log2FC_ttest_rawP_FDR.csv")
+message("완료: Control 대비(tnfa, 1K, 5K) heatmap + 요약 CSV 저장")
+
+---
+title: "BMDMs + TNF Inflammation Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+
+organism <- "mmusculus"                 # 사람 데이터면 "hsapiens"
+sources  <- c("GO:BP", "KEGG")          # ★ GO Biological Process + KEGG
+
+# ======================================================
+# Packages (필요시 자동 설치)
+# ======================================================
+req  <- c("readxl","readr","dplyr","stringr","purrr","tidyr",
+          "ggplot2","gprofiler2","ComplexHeatmap","circlize","grid")
+inst <- rownames(installed.packages())
+if (length(setdiff(req, inst)) > 0) {
+  install.packages(setdiff(req, inst), repos = "https://cloud.r-project.org")
+}
+suppressPackageStartupMessages({
+  library(readxl); library(readr); library(dplyr); library(stringr)
+  library(purrr);  library(tidyr);  library(ggplot2)
+  library(gprofiler2)
+  library(ComplexHeatmap); library(circlize); library(grid)
+})
+
+`%>%` <- magrittr::`%>%`
+
+# ======================================================
+# 공통 함수
+# ======================================================
+p_to_stars <- function(p){
+  ifelse(is.na(p), "",
+         ifelse(p < 0.001, "***",
+                ifelse(p < 0.01,  "**",
+                       ifelse(p < 0.05, "*", ""))))
+}
+
+# ======================================================
+# 1) 엑셀 읽기 + .endpoint (유전자명) 설정
+# ======================================================
+df_raw <- readxl::read_excel(excel_path, sheet = sheet_name)
+
+# 1~2열 중 NA가 덜 많은 쪽을 row label로 사용 (보통 GENE 열)
+candidate_label_cols <- names(df_raw)[1:min(2, ncol(df_raw))]
+row_label_col <- candidate_label_cols[
+  which.max(colSums(!is.na(df_raw[candidate_label_cols])))
+]
+if (is.na(row_label_col)) row_label_col <- names(df_raw)[1]
+
+df_raw <- df_raw %>%
+  dplyr::mutate(.endpoint = as.character(.data[[row_label_col]]))
+
+# ======================================================
+# 2) 헤더 파싱: control / tnfa / tnfa BMDMs 1K / tnfa BMDMs 5K
+#    각 그룹이 mean–SD–N 3열 블록 구조라고 가정
+# ======================================================
+cn_raw <- names(df_raw)
+
+norm_for_match <- function(x){
+  x %>%
+    stringr::str_replace_all("\u00A0", " ") %>%
+    stringr::str_replace_all("\\s+", " ") %>%
+    stringr::str_squish() %>%
+    stringr::str_replace("\\.\\.\\.\\d+$", "") %>%  # readxl 중복헤더 '...숫자' 제거
+    stringr::str_to_lower()
+}
+cn_norm <- norm_for_match(cn_raw)
+
+find_all <- function(pat){
+  which(stringr::str_detect(cn_norm,
+                            stringr::regex(pat, ignore_case = TRUE)))
+}
+
+p_ctrl <- "^control$"
+p_tnfa <- "^tnf[aα]$"
+p_1k   <- "^tnf[aα]\\s*bmdm[s]?\\s*1k$"
+p_5k   <- "^tnf[aα]\\s*bmdm[s]?\\s*5k$"
+
+idx_control <- find_all(p_ctrl)
+idx_tnfa    <- find_all(p_tnfa)
+idx_1k_all  <- find_all(p_1k)
+idx_5k_all  <- find_all(p_5k)
+
+if (length(idx_control) < 1)
+  stop("헤더 'control'을 찾지 못했습니다. 현재 헤더:\n",
+       paste(cn_raw, collapse=" | "))
+if (length(idx_tnfa) < 1)
+  stop("헤더 'tnfa'를 찾지 못했습니다. 현재 헤더:\n",
+       paste(cn_raw, collapse=" | "))
+
+# 5K: 명시적 5K가 있으면 그걸, 없으면 1K의 두 번째 occurrence를 5K로 사용
+if (length(idx_5k_all) >= 1) {
+  idx_5k <- idx_5k_all[1]
+} else if (length(idx_1k_all) >= 2) {
+  idx_5k <- idx_1k_all[2]
+  message(sprintf(
+    "참고: 'tnfa BMDMs 5K' 열이 없어 'tnfa BMDMs 1k'의 두 번째 발생(%s열, 원래명 '%s')을 5K로 간주합니다.",
+    idx_5k, cn_raw[idx_5k]
+  ))
+} else {
+  stop("5K 열을 찾지 못했습니다.")
+}
+
+if (length(idx_1k_all) >= 1) {
+  idx_1k <- idx_1k_all[1]
+} else {
+  stop("1K 열을 찾지 못했습니다.")
+}
+
+control_idx <- idx_control[1]
+tnfa_idx    <- idx_tnfa[1]
+
+mean_idx <- c(control_idx, tnfa_idx, idx_1k, idx_5k)
+sd_idx   <- mean_idx + 1L
+n_idx    <- mean_idx + 2L
+if (any(sd_idx > ncol(df_raw)) || any(n_idx > ncol(df_raw))) {
+  stop("SD/N 열 인덱스가 범위를 벗어납니다. (mean–SD–N 3열 블록 구조인지 확인)")
+}
+
+# 내부 그룹 이름
+mean_names <- c("control", "tnfa", "tnfa_BMDMs_1K", "tnfa_BMDMs_5K")
+sd_names   <- paste0(mean_names, "_sd")
+n_names    <- paste0(mean_names, "_n")
+
+# ======================================================
+# 3) long 포맷 (mean / sd / n) 만들기
+# ======================================================
+long_mean <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(mean_idx)) %>%
+  `colnames<-`(c(".endpoint", mean_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(mean_names),
+                      names_to = "group",
+                      values_to = "mean")
+
+long_sd <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(sd_idx)) %>%
+  `colnames<-`(c(".endpoint", sd_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(sd_names),
+                      names_to = "group_sd",
+                      values_to = "sd") %>%
+  dplyr::mutate(group = stringr::str_remove(group_sd, "_sd")) %>%
+  dplyr::select(-group_sd)
+
+long_n <- df_raw %>%
+  dplyr::select(.endpoint, tidyselect::all_of(n_idx)) %>%
+  `colnames<-`(c(".endpoint", n_names)) %>%
+  tidyr::pivot_longer(tidyselect::all_of(n_names),
+                      names_to = "group_n",
+                      values_to = "n") %>%
+  dplyr::mutate(group = stringr::str_remove(group_n, "_n")) %>%
+  dplyr::select(-group_n)
+
+dat_long <- long_mean %>%
+  dplyr::left_join(long_sd, by = c(".endpoint","group")) %>%
+  dplyr::left_join(long_n,  by = c(".endpoint","group")) %>%
+  dplyr::mutate(dplyr::across(c(mean, sd, n),
+                              ~ suppressWarnings(as.numeric(.)))) %>%
+  dplyr::filter(!is.na(mean), !is.na(sd), !is.na(n))
+
+# ======================================================
+# 4) Control 대비 Welch t-test + log2FC + FDR
+# ======================================================
+control_name <- "control"
+treat_groups <- c("tnfa", "tnfa_BMDMs_1K", "tnfa_BMDMs_5K")
+
+if (!(control_name %in% dat_long$group))
+  stop("control 열을 찾지 못했습니다.")
+
+ctrl_df <- dat_long %>%
+  dplyr::filter(group == control_name) %>%
+  dplyr::transmute(.endpoint,
+                   mean_c = mean, sd_c = sd, n_c = n)
+
+res_all <- lapply(treat_groups, function(g){
+  dat_long %>%
+    dplyr::filter(group == g) %>%
+    dplyr::transmute(.endpoint, group = g,
+                     mean_t = mean, sd_t = sd, n_t = n) %>%
+    dplyr::left_join(ctrl_df, by = ".endpoint") %>%
+    dplyr::mutate(
+      log2FC   = log2((mean_t + 1e-12)/(mean_c + 1e-12)),
+      se2      = (sd_t^2/n_t) + (sd_c^2/n_c),
+      t_stat   = (mean_t - mean_c)/sqrt(se2),
+      df_welch = se2^2 / (
+        (sd_t^2/n_t)^2/(pmax(n_t-1,1)+1e-12) +
+          (sd_c^2/n_c)^2/(pmax(n_c-1,1)+1e-12)
+      ),
+      p_value  = 2*pt(abs(t_stat), df = df_welch, lower.tail = FALSE),
+      contrast = paste0(g, " vs control")
+    ) %>%
+    dplyr::select(.endpoint, contrast, group,
+                  mean_c, sd_c, n_c,
+                  mean_t, sd_t, n_t,
+                  log2FC, t_stat, df_welch, p_value)
+}) %>%
+  dplyr::bind_rows() %>%
+  dplyr::group_by(contrast) %>%
+  dplyr::mutate(p_adj = p.adjust(p_value, method = "BH")) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(stars = p_to_stars(p_value))
+
+# 통계 결과 CSV로 저장 (네가 이미 쓰던 파일)
+readr::write_csv(
+  res_all %>%
+    dplyr::arrange(.endpoint,
+                   match(group, treat_groups)),
+  "Control_vs_tnfa_1K_5K_log2FC_ttest_rawP_FDR.csv"
+)
+
+# 여기서 실제로 5K vs control의 유의 up gene 수 확인 (디버깅용)
+res_all %>%
+  dplyr::filter(contrast == "tnfa_BMDMs_5K vs control",
+                p_adj < 0.05, log2FC > 0) %>%
+  dplyr::select(.endpoint, log2FC, p_value, p_adj) %>%
+  print()
+
+# ======================================================
+# 5) contrast별 과발현 유전자 리스트 만들기
+#    조건: p_adj < 0.05 & log2FC > 0
+# ======================================================
+lists <- res_all %>%
+  dplyr::filter(!is.na(p_adj), !is.na(log2FC)) %>%
+  dplyr::group_by(contrast) %>%
+  dplyr::summarise(
+    genes = list(
+      .endpoint[p_adj < 0.05 & log2FC > 0] %>%
+        as.character() %>% stringr::str_trim() %>% unique()
+    ),
+    n_up_sig = length(genes[[1]]),
+    .groups = "drop"
+  )
+
+message("대비별 유의적 UP (p_adj<0.05 & log2FC>0) 유전자 수:")
+print(lists %>% dplyr::select(contrast, n_up_sig))
+
+# 5K vs control 에서 실제 들어가는 유전자 확인
+lists %>%
+  dplyr::filter(contrast == "tnfa_BMDMs_5K vs control") %>%
+  tidyr::unnest(genes) %>%
+  print()
+
+# ======================================================
+# 6) g:Profiler (GO:BP + KEGG) — contrast별 실행
+# ======================================================
+dir.create("gprofiler_results", showWarnings = FALSE)
+dir.create("gprofiler_plots",   showWarnings = FALSE)
+
+run_one <- function(genes, tag) {
+  genes <- genes[!is.na(genes) & nzchar(genes)]
+  genes <- unique(genes)
+  if (length(genes) < 3) {
+    message(sprintf("[SKIP] %s — gene count < 3", tag))
+    return(NULL)
+  }
+  message(sprintf("[g:Profiler] %s (n=%d)", tag, length(genes)))
+  gp <- gprofiler2::gost(
+    query             = genes,
+    organism          = organism,
+    sources           = sources,     # GO:BP + KEGG
+    correction_method = "g_SCS",
+    user_threshold    = 0.05,
+    evcodes           = TRUE
+  )
+  if (is.null(gp) || is.null(gp$result)) return(NULL)
+  gp$result %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::mutate(tag = tag)
+}
+
+enr_list <- purrr::pmap(
+  list(lists$genes, lists$contrast),
+  function(gs, ct) run_one(gs, ct)
+)
+enr_list_nonnull <- purrr::discard(enr_list, is.null)
+
+if (length(enr_list_nonnull) > 0) {
+  enr <- dplyr::bind_rows(enr_list_nonnull)
+  
+  # --- source별로 분리 ---
+  enr_bp   <- enr %>% dplyr::filter(source == "GO:BP")
+  enr_kegg <- enr %>% dplyr::filter(source == "KEGG")
+  
+  # GO:BP 결과만 저장
+  if (nrow(enr_bp) > 0) {
+    readr::write_csv(
+      enr_bp,
+      file.path("gprofiler_results",
+                "GO_BP_enrichment_all_contrasts.csv")
+    )
+    message("저장: gprofiler_results/GO_BP_enrichment_all_contrasts.csv")
+  } else {
+    message("GO:BP enrichment 결과가 없습니다.")
+  }
+  
+  # KEGG 결과만 저장
+  if (nrow(enr_kegg) > 0) {
+    readr::write_csv(
+      enr_kegg,
+      file.path("gprofiler_results",
+                "KEGG_enrichment_all_contrasts.csv")
+    )
+    message("저장: gprofiler_results/KEGG_enrichment_all_contrasts.csv")
+  } else {
+    message("KEGG enrichment 결과가 없습니다.")
+  }
+  
+} else {
+  enr <- NULL
+  message("유효한 enrichment 결과가 없습니다. (g:Profiler 접속/threshold 확인)")
+}
+
+
+# ======================================================
+# 7) Bubble Plot (contrast별 × source별 상위 20 term)
+# ======================================================
+make_bubble_by_source <- function(df_contrast, contrast) {
+  if (is.null(df_contrast) || nrow(df_contrast) == 0)
+    return(invisible(NULL))
+  srcs <- sort(unique(df_contrast$source))
+  for (src in srcs) {
+    dsub <- df_contrast %>% dplyr::filter(source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- dsub %>%
+      dplyr::mutate(
+        neglog10p  = -log10(p_value + 1e-300),
+        gene_ratio = ifelse(term_size > 0,
+                            intersection_size/term_size,
+                            NA_real_)
+      ) %>%
+      dplyr::arrange(dplyr::desc(neglog10p)) %>%
+      dplyr::slice_head(n = 20)
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(x = neglog10p,
+                   y = reorder(term_name, neglog10p))
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = gene_ratio, color = neglog10p),
+        alpha = 0.85
+      ) +
+      ggplot2::scale_size_continuous(
+        name   = "Gene ratio",
+        limits = c(0,1)
+      ) +
+      ggplot2::scale_color_gradient(
+        name = "-log10(p)",
+        low  = "grey70",
+        high = "red"
+      ) +
+      ggplot2::labs(
+        title   = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x       = "-log10(p-value)",
+        y       = NULL,
+        caption = "g:Profiler (GO:BP + KEGG, g_SCS)"
+      ) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(
+        axis.text.y = ggplot2::element_text(size = 10),
+        plot.title  = ggplot2::element_text(face = "bold", size = 13)
+      )
+    
+    fn <- file.path(
+      "gprofiler_plots",
+      paste0(
+        gsub("[^A-Za-z0-9_\\-]+","_", contrast),
+        "_",
+        gsub(":", "_", src),
+        "_bubble.png"
+      )
+    )
+    ggplot2::ggsave(fn, p, width = 8, height = 6, dpi = 300)
+    message(sprintf("저장: %s", fn))
+  }
+  invisible(NULL)
+}
+
+if (!is.null(enr) && nrow(enr) > 0) {
+  enr %>%
+    split(.$tag) %>%
+    purrr::imap(~ make_bubble_by_source(.x, .y))
+}
+
+message("완료.")
+
+
+---
+title: "BMDMs + TNF alpha Inflammation gProfiler Bubbling Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# ======================================================
+# 결합 버블 플롯(정렬 버전): 세 대비를 같은 x,y에 정확히 정렬
+#   - 모양: 원(21)=TNF, 삼각형(24)=1K, 네모(22)=5K
+#   - 색상: fill = -log10(p)
+#   - 크기: overlap(genes) 이산 1·2·3·4·≥5
+# ======================================================
+getwd()
+make_bubble_combined <- function(enr_labeled,
+                                 source_filter = "KEGG",
+                                 top_n_per_tag = 10,
+                                 x_upper = 6,
+                                 file = file.path(plot_dir, paste0("combined_", source_filter, "_bubble.png"))) {
+  
+  df <- enr_labeled %>% dplyr::filter(source %in% source_filter)
+  
+  # 대비별 상위 N 추출 후 합집합 (prep_for_plot은 기존 것 사용)
+  top_by_tag <- df %>%
+    dplyr::group_by(tag) %>%
+    dplyr::group_modify(~ prep_for_plot(.x, top_n = top_n_per_tag)) %>%
+    dplyr::ungroup()
+  
+  # y축 정렬: 전체에서 max(-log10p)가 큰 순
+  term_order <- top_by_tag %>%
+    dplyr::group_by(label) %>%
+    dplyr::summarise(max_neglog10p = max(neglog10p, na.rm = TRUE), .groups = "drop") %>%
+    dplyr::arrange(dplyr::desc(max_neglog10p)) %>%
+    dplyr::pull(label)
+  
+  # 보기 좋은 tag 레이블
+  pretty_tag <- function(x) {
+    x %>% stringr::str_replace_all("_", " ") %>%
+      stringr::str_replace("^tnfa\\s*vs\\s*control$", "TNF vs control") %>%
+      stringr::str_replace("^tnfa bmdms 1k\\s*vs\\s*control$", "TNF BMDMs 1K vs control") %>%
+      stringr::str_replace("^tnfa bmdms 5k\\s*vs\\s*control$", "TNF BMDMs 5K vs control")
+  }
+  
+  plot_df <- top_by_tag %>%
+    dplyr::mutate(
+      label_fac = factor(label, levels = term_order),
+      tag_pretty = pretty_tag(stringr::str_to_lower(tag))
+    )
+  
+  shape_map <- c(
+    "TNF vs control"             = 21,  # 원
+    "TNF BMDMs 1K vs control"    = 24,  # 삼각형
+    "TNF BMDMs 5K vs control"    = 22   # 네모
+  )
+  
+  p <- ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(x = neglog10p, y = label_fac,
+                 shape = tag_pretty, size = overlap_lab, fill = neglog10p)
+  ) +
+    # ▼ 도징 제거 → 모두 같은 x,y에 정확히 겹치도록
+    ggplot2::geom_point(alpha = 0.80, stroke = 1.2) +
+    ggplot2::scale_shape_manual(name = "Contrast", values = shape_map) +
+    ggplot2::scale_size_manual(
+      name   = "Overlap (genes)",
+      values = c(4, 9, 16, 24, 30),      # 1,2,3,4,≥5 (원하면 더 과감히)
+      breaks = c("1","2","3","4","≥5"),
+      labels = c("1","2","3","4","≥5")
+    ) +
+    ggplot2::scale_fill_gradient(
+      name   = "-log10(p)",
+      low    = "#512DA8", high = "#F2C94C",
+      limits = c(0, x_upper)
+    ) +
+    ggplot2::scale_x_continuous(
+      limits = c(0, x_upper),
+      breaks = seq(0, x_upper, by = 1),
+      expand = ggplot2::expansion(mult = c(0, 0.02))
+    ) +
+    ggplot2::labs(
+      title = paste0(source_filter, " enrichment — combined (UP padj<0.05)"),
+      x = "-log10(p-value)", y = NULL
+    ) +
+    ggplot2::theme_minimal(base_size = 20, base_family = "Times New Roman") +
+    ggplot2::theme(
+      legend.position = "right",
+      legend.box      = "vertical",
+      axis.text.y     = ggplot2::element_text(size = 22, face = "bold"),
+      axis.text.x     = ggplot2::element_text(size = 22, face = "bold"),
+      axis.title.x    = ggplot2::element_text(size = 24, face = "bold",
+                                              margin = ggplot2::margin(t = 12)),
+      plot.title      = ggplot2::element_text(size = 24, face = "bold",
+                                              margin = ggplot2::margin(b = 12))
+    ) +
+    ggplot2::guides(
+      fill  = ggplot2::guide_colorbar(direction = "vertical",
+                                      barheight = ggplot2::unit(12, "cm"),
+                                      barwidth  = ggplot2::unit(0.8, "cm"),
+                                      title.position = "top"),
+      size  = ggplot2::guide_legend(override.aes = list(alpha = 0.95, fill = "grey70")),
+      shape = ggplot2::guide_legend(override.aes = list(size = 8, fill = "grey70"))
+    )
+  
+  ggplot2::ggsave(file, p, width = 16, height = 10, dpi = 600)
+  message("저장: ", file)
+}
+
+# 사용 예:
+make_bubble_combined(enr_labeled, source_filter = "KEGG",
+                    top_n_per_tag = 10, x_upper = 6)
+
+
+---
+title: "BMDMs + TNFa Inflammation gProfiler Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+
+# ======================================================
+# 1) 입력/출력
+# ======================================================
+enrich_xlsx <- "KEGG_enrichment_all_contrasts.xlsx"   # ★ XLSX 사용
+out_csv     <- "gprofiler_results/enrichment_with_labels.csv"
+plot_dir    <- "gprofiler_plots"
+dir.create(dirname(out_csv), showWarnings = FALSE, recursive = TRUE)
+dir.create(plot_dir,          showWarnings = FALSE, recursive = TRUE)
+
+# ======================================================
+# 2) XLSX 읽기 (모든 시트를 읽어 하나로 결합)
+#    - 시트명은 contrast 'tag'로 사용
+#    - 만약 시트 안에 이미 tag 컬럼이 있으면 그것을 우선 사용
+# ======================================================
+sheets <- readxl::excel_sheets(enrich_xlsx)
+if (length(sheets) < 1) stop("엑셀 파일에 시트가 없습니다: ", enrich_xlsx)
+
+enr_list <- purrr::imap(sheets, function(sh, i) {
+  df <- readxl::read_excel(enrich_xlsx, sheet = sh)
+  # 열 이름 통일(문자) 및 공백 정리
+  names(df) <- names(df) %>% stringr::str_squish()
+  # tag 컬럼 없으면 시트명으로 생성
+  if (!"tag" %in% names(df)) df$tag <- sh
+  df
+})
+
+enr <- dplyr::bind_rows(enr_list)
+
+# 필수 컬럼 확인
+required_cols <- c("tag","source","term_id","term_name","p_value","term_size","intersection_size")
+miss <- setdiff(required_cols, names(enr))
+if (length(miss) > 0) {
+  stop("입력 XLSX에 다음 컬럼이 없습니다: ", paste(miss, collapse=", "))
+}
+
+# ======================================================
+# 3) 라벨 적용 (대/소문자/공백 정규화 후 조인)
+# ======================================================
+norm_key <- function(x) stringr::str_squish(stringr::str_to_lower(x))
+
+enr_key <- enr %>%
+  dplyr::mutate(source_key = norm_key(source),
+                term_key   = norm_key(term_name))
+
+map_key <- rename_pairs %>%
+  dplyr::mutate(source_key = norm_key(source),
+                term_key   = norm_key(term_name)) %>%
+  dplyr::select(source_key, term_key, new_label)
+
+enr_labeled <- enr_key %>%
+  dplyr::left_join(map_key, by = c("source_key","term_key")) %>%
+  dplyr::mutate(label = dplyr::coalesce(new_label, term_name)) %>%
+  dplyr::select(-source_key, -term_key)
+
+# ======================================================
+# 4) 플롯 제외 항목 제거(원명/라벨 모두 기준, 정규화)
+# ======================================================
+drop_key <- norm_key(drop_terms)
+enr_labeled <- enr_labeled %>%
+  dplyr::mutate(term_key  = norm_key(term_name),
+                label_key = norm_key(label)) %>%
+  dplyr::filter(!(term_key  %in% drop_key),
+                !(label_key %in% drop_key)) %>%
+  dplyr::select(-term_key, -label_key)
+
+readr::write_csv(enr_labeled, out_csv)
+message("라벨 적용 + 삭제 반영 완료: ", out_csv)
+
+# ======================================================
+# 5) 플롯 전처리
+# ======================================================
+prep_for_plot <- function(df, top_n = 20, wrap_width = 40) {
+  df %>%
+    dplyr::mutate(
+      term_size         = suppressWarnings(as.numeric(term_size)),
+      intersection_size = suppressWarnings(as.numeric(intersection_size)),
+      p_value           = suppressWarnings(as.numeric(p_value)),
+      neglog10p         = -log10(p_value + 1e-300),
+      overlap_n         = as.integer(intersection_size),
+      overlap_bin = dplyr::case_when(
+        is.na(overlap_n) ~ NA_integer_,
+        overlap_n <= 1   ~ 1L,
+        overlap_n == 2   ~ 2L,
+        overlap_n == 3   ~ 3L,
+        overlap_n == 4   ~ 4L,
+        overlap_n >= 5   ~ 5L
+      ),
+      overlap_lab = factor(overlap_bin, levels = 1:5,
+                           labels = c("1","2","3","4","≥5")),
+      plot_label = stringr::str_wrap(label, width = wrap_width)
+    ) %>%
+    dplyr::arrange(dplyr::desc(neglog10p)) %>%
+    dplyr::slice_head(n = top_n)
+}
+
+# ======================================================
+# 6) Bubble plot (색상바 길이 크게, x축 상한 조절 가능)
+# ======================================================
+make_bubble_by_source <- function(df_contrast, contrast, top_n = 20, x_upper = 4.5) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- prep_for_plot(dsub, top_n)
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(x = neglog10p, y = reorder(plot_label, neglog10p))
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = overlap_lab, color = neglog10p),
+        alpha = 0.9
+      ) +
+      ggplot2::scale_size_manual(
+        name   = "Overlap (genes)",
+        values = c(4, 9, 14, 18, 24),
+        breaks = c("1","2","3","4","≥5"),
+        labels = c("1","2","3","4","≥5"),
+        guide  = ggplot2::guide_legend(override.aes = list(alpha = 0.9))
+      ) +
+      ggplot2::scale_color_gradient(
+        name   = "-log10(p)",
+        low    = "#7E57C2",
+        high   = "#F2C94C",
+        limits = c(0, 6)
+      ) +
+      ggplot2::scale_x_continuous(
+        limits = c(0, 6),
+        breaks = seq(0, 6, by = 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))
+      ) +
+      ggplot2::guides(
+        color = ggplot2::guide_colorbar(
+          direction      = "vertical",
+          barheight      = ggplot2::unit(12, "cm"),
+          barwidth       = ggplot2::unit(0.8, "cm"),
+          ticks          = TRUE,
+          title.position = "top"
+        ),
+        size = ggplot2::guide_legend(override.aes = list(alpha = 0.9))
+      ) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)", y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 20, base_family = "Times New Roman") +
+      ggplot2::theme(
+        legend.position = "right",
+        legend.box      = "vertical",
+        text         = ggplot2::element_text(family = "Times New Roman"),
+        axis.text.y  = ggplot2::element_text(size = 24, face = "bold"),
+        axis.text.x  = ggplot2::element_text(size = 24, face = "bold"),
+        axis.title.x = ggplot2::element_text(size = 22, face = "bold",
+                                             margin = ggplot2::margin(t = 12)),
+        plot.title   = ggplot2::element_text(size = 24, face = "bold",
+                                             margin = ggplot2::margin(b = 12)),
+        legend.title = ggplot2::element_text(size = 30),
+        legend.text  = ggplot2::element_text(size = 24)
+      )
+    
+    fn <- file.path(plot_dir,
+                    paste0(gsub("[^A-Za-z0-9_\\-]+","_", contrast), "_", gsub(":","_", src), "_bubble.png"))
+    ggplot2::ggsave(fn, p, width = 15, height = 10, dpi = 600)
+    message(sprintf("저장: %s (x_upper=%.2f; overlap bins: %s)",
+                    fn, x_upper, paste(levels(dfp$overlap_lab), collapse=", ")))
+  }
+}
+
+# ======================================================
+# 7) Horizontal bar plot (옵션)
+# ======================================================
+make_bar_by_source <- function(df_contrast, contrast, top_n = 20) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- prep_for_plot(dsub, top_n)
+    
+    p <- ggplot2::ggplot(dfp, ggplot2::aes(y = reorder(plot_label, neglog10p), x = neglog10p)) +
+      ggplot2::geom_col(width = 0.65) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", neglog10p)),
+                         hjust = -0.1, size = 4) +
+      ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.08))) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)", y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 14) +
+      ggplot2::theme(
+        axis.text.y = ggplot2::element_text(size = 12),
+        plot.title  = ggplot2::element_text(face = "bold", size = 14)
+      )
+    
+    fn <- file.path(plot_dir,
+                    paste0(gsub("[^A-Za-z0-9_\\-]+","_", contrast), "_",
+                           gsub(":","_", src), "_bar.png"))
+    ggplot2::ggsave(fn, p, width = 9, height = 6.5, dpi = 300)
+    message("저장: ", fn)
+  }
+}
+
+# ======================================================
+# 8) 대비(tag) × 소스별 그림 생성
+# ======================================================
+enr_labeled %>%
+  split(.$tag) %>%
+  purrr::imap(~ {
+    make_bubble_by_source(.x, .y, top_n = 20, x_upper = 4.5)
+    make_bar_by_source(   .x, .y, top_n = 20)
+  })
+
+message("완료: PNGs -> ", normalizePath(plot_dir))
+
+
+---
+title: "BMDMs + TNF alpha Inflammation Networking Process"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# ======================================================
+# 0) 패키지 로드 & 유틸 (에러 방지: 폰트 폴백, 숫자 강제, NA 안전 처리)
+# ======================================================
+suppressPackageStartupMessages({
+  library(tibble); library(readr); library(readxl)
+  library(dplyr);  library(stringr); library(purrr)
+  library(tidyr);  library(ggplot2)
+  library(igraph); library(ggraph); library(ggrepel); library(scales)
+})
+
+# ----- 안전한 폰트 선택: Times New Roman이 없으면 sans로 폴백
+choose_font <- function(preferred = "Times New Roman", fallback = "sans"){
+  has_sysfonts <- requireNamespace("systemfonts", quietly = TRUE)
+  if (!has_sysfonts) return(fallback)
+  fm <- try(systemfonts::system_fonts(), silent = TRUE)
+  if (inherits(fm, "try-error")) return(fallback)
+  if (any(grepl(sprintf("^%s$", preferred), fm$family, ignore.case = TRUE))) preferred else fallback
+}
+BASE_FONT <- choose_font()
+
+# ----- 안전한 숫자 변환
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+# ----- 디렉토리 보장
+ensuredir <- function(path){
+  dir.create(path, showWarnings = FALSE, recursive = TRUE)
+  path
+}
+
+# ----- 문자열 정규화 키
+norm_key <- function(x) stringr::str_squish(stringr::str_to_lower(x))
+
+# ----- intersections/genes 컬럼 자동 탐지
+detect_intersection_col <- function(df){
+  cand <- tolower(names(df))
+  hits <- which(cand %in% c("intersection","intersections","intersection_genes","intersections.genes"))
+  if (length(hits) == 0) return(NULL)
+  names(df)[hits[1]]
+}
+
+# ----- 교집합 문자열 파싱 (빈 토큰 제거)
+split_genes <- function(x){
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  stringr::str_split(x, pattern = "[,;\\s]+", simplify = FALSE)[[1]] |>
+    stringr::str_trim() |>
+    purrr::discard(~ .x == "")
+}
+
+# ======================================================
+# 1) 라벨 테이블 / 드롭 리스트
+# ======================================================
+rename_pairs <- tibble::tribble(
+  ~source, ~term_name, ~new_label,
+  # 핵심 염증 신호
+  "KEGG","TNF signaling pathway","TNF–NFκB axis signaling",
+  "KEGG","NF-kappa B signaling pathway","NF-κB inflammatory signaling",
+  "KEGG","NOD-like receptor signaling pathway","NOD-like receptor / inflammasome priming",
+  # 치환 예시
+  "KEGG","Viral Protein interaction with cytokine and cytokine receptor","Cytosolic DNA-sensing pathway",
+  # 장 염증 맥락
+  "KEGG","Inflammatory bowel disease","IBD-like intestinal inflammatory program",
+  "KEGG","Rheumatoid arthritis","Cytokine-mediated intestinal inflammation ",
+  # 대사-면역 교차
+  "KEGG","Adipocytokine signaling pathway","Cytokine–immune crosstalk",
+  # 'lipid' 제거형 요약
+  "KEGG","Lipid and atherosclerosis","Barrier-associated inflammatory remodeling"
+)
+
+drop_terms <- c(
+  "Kaposi sarcoma-associated herpesvirus infection",
+  "African trypanosomiasis",
+  "Human cytomegalovirus infection",
+  "Malaria",
+  "Amoebiasis",
+  "Alcoholic liver disease",
+  "Leishmaniasis",
+  "Legionellosis"
+)
+
+# ======================================================
+# 2) 입출력 경로
+# ======================================================
+enrich_xlsx <- "GO_enrichment_all_contrasts.xlsx"   # ★ XLSX
+out_csv     <- "gprofiler_results/enrichment_with_labels.csv"
+plot_dir    <- ensuredir("gprofiler_plots")
+ensuredir(dirname(out_csv))
+
+# ======================================================
+# 3) XLSX 전 시트 로드 → 결합 (+ tag 보정)
+# ======================================================
+if (!file.exists(enrich_xlsx)) stop("엑셀 파일이 존재하지 않습니다: ", enrich_xlsx)
+
+sheets <- readxl::excel_sheets(enrich_xlsx)
+if (length(sheets) < 1) stop("엑셀 파일에 시트가 없습니다: ", enrich_xlsx)
+
+enr_list <- purrr::imap(sheets, function(sh, i) {
+  df <- readxl::read_excel(enrich_xlsx, sheet = sh)
+  if (nrow(df) == 0) return(NULL)
+  names(df) <- names(df) %>% stringr::str_squish()
+  if (!"tag" %in% names(df)) df$tag <- sh
+  df
+}) |> purrr::compact()
+
+if (length(enr_list) == 0) stop("모든 시트가 비어 있습니다: ", enrich_xlsx)
+
+enr <- dplyr::bind_rows(enr_list)
+
+# 필수 컬럼 확인
+required_cols <- c("tag","source","term_id","term_name","p_value","term_size","intersection_size")
+miss <- setdiff(required_cols, names(enr))
+if (length(miss) > 0) stop("입력 XLSX에 다음 컬럼이 없습니다: ", paste(miss, collapse=", "))
+
+# ======================================================
+# 4) 라벨 매핑 + 드랍
+# ======================================================
+enr_key <- enr %>%
+  dplyr::mutate(source_key = norm_key(source),
+                term_key   = norm_key(term_name))
+
+map_key <- rename_pairs %>%
+  dplyr::mutate(source_key = norm_key(source),
+                term_key   = norm_key(term_name)) %>%
+  dplyr::select(source_key, term_key, new_label)
+
+enr_labeled <- enr_key %>%
+  dplyr::left_join(map_key, by = c("source_key","term_key")) %>%
+  dplyr::mutate(
+    label              = dplyr::coalesce(new_label, term_name),
+    term_size          = to_num(term_size),
+    intersection_size  = to_num(intersection_size),
+    p_value            = to_num(p_value)
+  ) %>%
+  dplyr::select(-source_key, -term_key, -new_label)
+
+drop_key <- norm_key(drop_terms)
+enr_labeled <- enr_labeled %>%
+  dplyr::mutate(term_key  = norm_key(term_name),
+                label_key = norm_key(label)) %>%
+  dplyr::filter(!(term_key  %in% drop_key),
+                !(label_key %in% drop_key)) %>%
+  dplyr::select(-term_key, -label_key)
+
+readr::write_csv(enr_labeled, out_csv)
+message("라벨 적용 + 제외 반영 완료: ", normalizePath(out_csv))
+
+# ======================================================
+# 5) 플롯 준비/헬퍼
+# ======================================================
+prep_for_plot <- function(df, top_n = 20, wrap_width = 40) {
+  if (nrow(df) == 0) return(df)
+  df %>%
+    dplyr::mutate(
+      term_size         = to_num(term_size),
+      intersection_size = to_num(intersection_size),
+      p_value           = to_num(p_value),
+      neglog10p         = -log10(p_value + 1e-300),
+      overlap_n         = as.integer(intersection_size),
+      overlap_bin = dplyr::case_when(
+        is.na(overlap_n) ~ NA_integer_,
+        overlap_n <= 1   ~ 1L,
+        overlap_n == 2   ~ 2L,
+        overlap_n == 3   ~ 3L,
+        overlap_n == 4   ~ 4L,
+        overlap_n >= 5   ~ 5L
+      ),
+      overlap_lab = factor(overlap_bin, levels = 1:5,
+                           labels = c("1","2","3","4","≥5")),
+      plot_label = stringr::str_wrap(label, width = wrap_width)
+    ) %>%
+    dplyr::arrange(dplyr::desc(neglog10p)) %>%
+    dplyr::slice_head(n = top_n)
+}
+
+# ======================================================
+# 6) Bubble plot / Bar plot (옵션)
+# ======================================================
+make_bubble_by_source <- function(df_contrast, contrast, top_n = 20, x_limit = 6) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- prep_for_plot(dsub, top_n)
+    if (nrow(dfp) == 0) next
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(x = neglog10p, y = reorder(plot_label, neglog10p))
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = overlap_lab, color = neglog10p),
+        alpha = 0.9
+      ) +
+      ggplot2::scale_size_manual(
+        name   = "Overlap (genes)",
+        values = c(4, 9, 14, 18, 24),
+        breaks = c("1","2","3","4","≥5"),
+        labels = c("1","2","3","4","≥5"),
+        guide  = ggplot2::guide_legend(override.aes = list(alpha = 0.9))
+      ) +
+      ggplot2::scale_color_gradient(
+        name   = "-log10(p)",
+        low    = "blue",
+        high   = "red",
+        limits = c(0, x_limit)
+      ) +
+      ggplot2::scale_x_continuous(
+        limits = c(0, x_limit),
+        breaks = seq(0, x_limit, by = 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))
+      ) +
+      ggplot2::guides(
+        color = ggplot2::guide_colorbar(
+          direction      = "vertical",
+          barheight      = ggplot2::unit(12, "cm"),
+          barwidth       = ggplot2::unit(0.8, "cm"),
+          ticks          = TRUE,
+          title.position = "top"
+        ),
+        size = ggplot2::guide_legend(override.aes = list(alpha = 0.9))
+      ) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)", y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 20) +
+      ggplot2::theme(
+        legend.position = "right",
+        legend.box      = "vertical",
+        text         = ggplot2::element_text(family = BASE_FONT),
+        axis.text.y  = ggplot2::element_text(size = 24, face = "bold"),
+        axis.text.x  = ggplot2::element_text(size = 24, face = "bold"),
+        axis.title.x = ggplot2::element_text(size = 22, face = "bold",
+                                             margin = ggplot2::margin(t = 12)),
+        plot.title   = ggplot2::element_text(size = 24, face = "bold",
+                                             margin = ggplot2::margin(b = 12)),
+        legend.title = ggplot2::element_text(size = 30),
+        legend.text  = ggplot2::element_text(size = 24)
+      )
+    
+    fn <- file.path(plot_dir,
+                    paste0(gsub("[^A-Za-z0-9_\\-]+","_", contrast), "_",
+                           gsub(":","_", src), "_bubble.png"))
+    ggplot2::ggsave(fn, p, width = 15, height = 10, dpi = 600)
+    message("저장: ", normalizePath(fn))
+  }
+}
+
+make_bar_by_source <- function(df_contrast, contrast, top_n = 20) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    dfp <- prep_for_plot(dsub, top_n)
+    if (nrow(dfp) == 0) next
+    
+    p <- ggplot2::ggplot(dfp, ggplot2::aes(y = reorder(plot_label, neglog10p), x = neglog10p)) +
+      ggplot2::geom_col(width = 0.65) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.2f", neglog10p)),
+                         hjust = -0.1, size = 4, family = BASE_FONT) +
+      ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.08))) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ", contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)", y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 14) +
+      ggplot2::theme(
+        text        = ggplot2::element_text(family = BASE_FONT),
+        axis.text.y = ggplot2::element_text(size = 12),
+        plot.title  = ggplot2::element_text(face = "bold", size = 14)
+      )
+    
+    fn <- file.path(plot_dir,
+                    paste0(gsub("[^A-Za-z0-9_\\-]+","_", contrast), "_",
+                           gsub(":","_", src), "_bar.png"))
+    ggplot2::ggsave(fn, p, width = 9, height = 6.5, dpi = 300)
+    message("저장: ", normalizePath(fn))
+  }
+}
+
+# ======================================================
+# 7) 대비(tag) × source 그림 생성
+# ======================================================
+enr_labeled %>%
+  split(.$tag) %>%
+  purrr::imap(~ {
+    make_bubble_by_source(.x, .y, top_n = 20, x_limit = 6)
+    make_bar_by_source(   .x, .y, top_n = 20)
+  })
+
+message("완료: PNGs -> ", normalizePath(plot_dir))
+
+# ======================================================
+# 8) 전역 KEGG term 네트워크
+# ======================================================
+build_global_term_network <- function(enr_labeled, source_filter = "KEGG",
+                                      min_overlap = 3, jaccard_cut = 0.2){
+  
+  df0 <- enr_labeled %>%
+    dplyr::filter(source %in% source_filter) %>%
+    dplyr::mutate(p_value = to_num(p_value))
+  
+  if (nrow(df0) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  inter_col <- detect_intersection_col(df0)
+  if (is.null(inter_col))
+    stop("intersection 유전자 컬럼을 찾지 못했습니다. (g:Profiler의 'intersections' 포함 여부 확인)")
+  
+  df2 <- df0 %>%
+    dplyr::mutate(
+      neglog10p = -log10(p_value + 1e-300),
+      genes     = purrr::map(.data[[inter_col]], split_genes)
+    ) %>%
+    dplyr::filter(lengths(genes) > 0)
+  
+  if (nrow(df2) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  nodes <- df2 %>%
+    dplyr::group_by(term_id) %>%
+    dplyr::summarise(
+      term_name     = dplyr::first(term_name),
+      label         = dplyr::first(label),
+      source        = dplyr::first(source),
+      tags          = list(unique(tag)),
+      tag_count     = dplyr::n_distinct(tag),
+      neglog10p_max = max(neglog10p, na.rm = TRUE),
+      term_size     = suppressWarnings(max(as.numeric(term_size), na.rm = TRUE)),
+      genes         = list(unique(unlist(genes))),
+      .groups = "drop"
+    )
+  
+  if (nrow(nodes) < 2) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = tibble()))
+  
+  comb <- utils::combn(nodes$term_id, 2)
+  if (length(comb) == 0) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = tibble()))
+  comb  <- t(comb)
+  
+  edges <- tibble::tibble(term1 = comb[,1], term2 = comb[,2]) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term1" = "term_id")) %>%
+    dplyr::rename(genes1 = genes) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term2" = "term_id")) %>%
+    dplyr::rename(genes2 = genes) %>%
+    dplyr::mutate(
+      overlap = purrr::map2_int(genes1, genes2, ~ length(intersect(.x, .y))),
+      union_sz= purrr::map2_int(genes1, genes2, ~ length(union(.x, .y))),
+      jaccard = dplyr::if_else(union_sz > 0, overlap/union_sz, 0)
+    ) %>%
+    dplyr::filter(overlap >= min_overlap, jaccard >= jaccard_cut) %>%
+    dplyr::select(term1, term2, overlap, jaccard)
+  
+  if (nrow(edges) == 0) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = edges))
+  
+  verts_atomic <- nodes %>%
+    dplyr::transmute(
+      name = term_id,
+      term_name, label, source,
+      tag_count, neglog10p_max, term_size
+    )
+  
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = verts_atomic)
+  list(g = g, nodes = nodes, edges = edges)
+}
+
+# ----------------------------
+# (보조) Jaccard 가중 레이아웃 계산 → 노드 간격 완화
+# ----------------------------
+compute_tight_layout <- function(g, seed = 42, tighten_factor = 0.75){
+  set.seed(seed)
+  jac <- igraph::E(g)$jaccard; jac[is.na(jac)] <- 0
+  w <- scales::rescale(jac, to = c(1, 8), from = range(jac, na.rm = TRUE))
+  lay <- igraph::layout_with_fr(g, weights = w, niter = 4000, grid = "nogrid", start.temp = 0.05)
+  lay <- scale(lay); lay <- lay * tighten_factor
+  colnames(lay) <- c("x","y")
+  as.data.frame(lay)
+}
+
+plot_global_term_network <- function(net,
+                                     title = "KEGG term network (all contrasts)",
+                                     node_cap = 6,
+                                     seed = 42,
+                                     width = 30, height = 30, dpi = 600,
+                                     file_png = file.path(plot_dir, "KEGG_all_union_network.png"),
+                                     family = BASE_FONT,
+                                     fontsize = 18,
+                                     label_scale = 4.5  # ← 라벨 배율(크게). 더 키우고 싶으면 6~8까지 올려도 됨
+){
+  if (!inherits(net, "list") || is.null(net$g) ||
+      igraph::gorder(net$g) == 0 || igraph::gsize(net$g) == 0) {
+    message("노드/엣지 부족 → 스킵: ", file_png); return(invisible(NULL))
+  }
+  
+  nlogp <- igraph::V(net$g)$neglog10p_max
+  tcnt  <- igraph::V(net$g)$tag_count
+  lab   <- igraph::V(net$g)$label
+  act_cat <- dplyr::case_when(tcnt >= 3 ~ "3 contrasts",
+                              tcnt == 2 ~ "2 contrasts",
+                              TRUE      ~ "1 contrast")
+  lab_wrap <- stringr::str_wrap(lab, 38)
+  
+  net$g <- igraph::set_vertex_attr(net$g, "neglog10p_c", value = pmin(nlogp, node_cap))
+  net$g <- igraph::set_vertex_attr(net$g, "act_cat",     value = act_cat)
+  net$g <- igraph::set_vertex_attr(net$g, "label_wrap",  value = lab_wrap)
+  
+  coords <- compute_tight_layout(net$g, seed = seed, tighten_factor = 0.75)
+  
+  edge_width_fixed <- 1.2
+  p <- ggraph::ggraph(net$g, layout = "manual", x = coords$x, y = coords$y) +
+    ggraph::geom_edge_link(aes(alpha = jaccard),
+                           colour = "black", linewidth = edge_width_fixed, lineend = "round") +
+    ggraph::scale_edge_alpha(name = "Jaccard", limits = c(0,1),
+                             range = c(0.15,0.95),
+                             breaks = c(0.25,0.50,0.75,1.00),
+                             labels = c("0.25","0.50","0.75","1.00")) +
+    ggraph::geom_node_point(aes(size = neglog10p_c, fill = act_cat),
+                            shape = 21, colour = "grey10", stroke = 0.8) +
+    ggplot2::scale_size_continuous(name = "max -log10(p)", range = c(6, 22),
+                                   limits = c(0, node_cap)) +
+    ggplot2::scale_fill_manual(
+      name = "Activated in…",
+      values = c("1 contrast" = "black",
+                 "2 contrasts" = "#7B1FA2",
+                 "3 contrasts" = "#FFC107")
+    ) +
+    # ===== 라벨을 크게 =====
+  ggraph::geom_node_text(aes(label = label_wrap),
+                         repel = TRUE,
+                         family = family,
+                         size = (fontsize/3.1) * label_scale,  # ← 여기서 크게
+                         segment.alpha = .65,
+                         box.padding   = .9,
+                         point.padding = .8,
+                         max.overlaps  = Inf) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme_void(base_family = family) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = (fontsize + 6) * 2.4, face = "bold"),
+      legend.title    = ggplot2::element_text(size = (fontsize)      * 2.2, face = "bold"),
+      legend.text     = ggplot2::element_text(size = (fontsize - 2)  * 2.0),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      panel.background= ggplot2::element_rect(fill = "white", colour = NA),
+      legend.background=ggplot2::element_rect(fill = "white", colour = NA)
+    )
+  
+  ggplot2::ggsave(file_png, p, width = width, height = height, dpi = dpi)
+  message("저장: ", normalizePath(file_png))
+}
+
+
+# ---------------- 실행 ----------------
+net_all <- build_global_term_network(
+  enr_labeled,
+  source_filter = "KEGG",
+  min_overlap = 3,
+  jaccard_cut = 0.0
+)
+
+plot_global_term_network(
+  net_all,
+  title    = "KEGG term network — all contrasts (edge alpha = Jaccard)",
+  node_cap = 6,
+  file_png = file.path(plot_dir, "KEGG_all_union_network.png"),
+  family   = BASE_FONT
+)
+
+message("전체 파이프라인 완료.")
+
+# ======================================================
+# 8) 전역 KEGG term 네트워크 — 밀집/겹침 해결 버전 (전체 교체)
+# ======================================================
+
+# --- 0) 유틸 ---
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+split_genes <- function(x){
+  if (is.null(x) || is.na(x)) return(character(0))
+  x <- as.character(x)
+  unlist(strsplit(x, "[,;\\s]+"))
+}
+
+# g:Profiler 교차 유전자 컬럼 자동탐지
+detect_intersection_col <- function(df){
+  cand <- c("intersections", "intersection", "intersect", "genes", "overlap_genes")
+  cand[ cand %in% names(df) ][1]
+}
+
+# --- 1) 네트워크 구성: Jaccard + overlap 기준 필터 ---
+build_global_term_network <- function(enr_labeled, source_filter = "KEGG",
+                                      min_overlap = 3, jaccard_cut = 0.2){
+  
+  df0 <- enr_labeled %>%
+    dplyr::filter(source %in% source_filter) %>%
+    dplyr::mutate(
+      p_value = to_num(p_value),
+      neglog10p = -log10(p_value + 1e-300)
+    )
+  
+  if (nrow(df0) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  inter_col <- detect_intersection_col(df0)
+  if (is.null(inter_col))
+    stop("intersection 유전자 컬럼을 찾지 못했습니다. (g:Profiler 'intersections' 컬럼 필요)")
+  
+  df2 <- df0 %>%
+    dplyr::mutate(genes = purrr::map(.data[[inter_col]], split_genes)) %>%
+    dplyr::filter(lengths(genes) > 0)
+  
+  if (nrow(df2) == 0) return(list(g = igraph::make_empty_graph(), nodes = tibble(), edges = tibble()))
+  
+  nodes <- df2 %>%
+    dplyr::group_by(term_id) %>%
+    dplyr::summarise(
+      term_name     = dplyr::first(term_name),
+      label         = dplyr::first(label),
+      source        = dplyr::first(source),
+      tags          = list(unique(tag)),
+      tag_count     = dplyr::n_distinct(tag),
+      neglog10p_max = max(neglog10p, na.rm = TRUE),
+      term_size     = suppressWarnings(max(as.numeric(term_size), na.rm = TRUE)),
+      genes         = list(unique(unlist(genes))),
+      .groups = "drop"
+    )
+  
+  if (nrow(nodes) < 2) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = tibble()))
+  
+  comb <- utils::combn(nodes$term_id, 2)
+  comb  <- t(comb)
+  
+  edges <- tibble::tibble(term1 = comb[,1], term2 = comb[,2]) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term1" = "term_id")) %>%
+    dplyr::rename(genes1 = genes) %>%
+    dplyr::left_join(nodes %>% dplyr::select(term_id, genes), by = c("term2" = "term_id")) %>%
+    dplyr::rename(genes2 = genes) %>%
+    dplyr::mutate(
+      overlap = purrr::map2_int(genes1, genes2, ~ length(intersect(.x, .y))),
+      union_sz= purrr::map2_int(genes1, genes2, ~ length(union(.x, .y))),
+      jaccard = dplyr::if_else(union_sz > 0, overlap/union_sz, 0)
+    ) %>%
+    dplyr::filter(overlap >= min_overlap, jaccard >= jaccard_cut) %>%
+    dplyr::select(term1, term2, overlap, jaccard)
+  
+  if (nrow(edges) == 0) return(list(g = igraph::make_empty_graph(), nodes = nodes, edges = edges))
+  
+  verts_atomic <- nodes %>%
+    dplyr::transmute(
+      name = term_id,
+      term_name, label, source,
+      tag_count, neglog10p_max, term_size
+    )
+  
+  g <- igraph::graph_from_data_frame(edges, directed = FALSE, vertices = verts_atomic)
+  list(g = g, nodes = nodes, edges = edges)
+}
+
+# --- 2) 엣지 슬리밍: 노드당 상위 k개만 남기기 ---
+prune_edges_topk <- function(g, k = 3){
+  if (igraph::gsize(g) == 0) return(g)
+  E(g)$orig_id <- seq_len(igraph::gsize(g))
+  # 각 노드에 대해 incident edge 중 jaccard 상위 k개만 keep
+  keep_ids <- unique(unlist(lapply(V(g), function(v){
+    es <- incident(g, v, mode = "all")
+    if (length(es) <= k) return(E(g)[es]$orig_id)
+    ord <- order(E(g)[es]$jaccard, decreasing = TRUE)[seq_len(k)]
+    E(g)[es][ord]$orig_id
+  })))
+  delete_edges <- setdiff(E(g)$orig_id, keep_ids)
+  g <- igraph::delete_edges(g, E(g)[E(g)$orig_id %in% delete_edges])
+  g
+}
+
+# --- 3) 레이아웃(충돌 완화 + 분산) ---
+compute_tight_layout <- function(g, seed = 42, area_scale = 2.0, iter = 5000){
+  set.seed(seed)
+  jac <- igraph::E(g)$jaccard; jac[is.na(jac)] <- 0
+  w <- scales::rescale(jac, to = c(1, 8), from = range(jac, na.rm = TRUE))
+  # 넓은 면적/충돌 완화: area_scale, niter↑
+  lay <- igraph::layout_with_fr(g, weights = w, niter = iter, grid = "nogrid", start.temp = 0.05, area = vcount(g)^2 * area_scale)
+  lay <- scale(lay)
+  colnames(lay) <- c("x","y")
+  as.data.frame(lay)
+}
+
+# --- 4) 플로팅: 라벨 겹침 방지/가독성 극대화 ---
+plot_global_term_network <- function(net,
+                                     title = "KEGG term network — all contrasts (edge α = Jaccard)",
+                                     node_cap = 6,
+                                     seed = 42,
+                                     width = 40, height = 32, dpi = 600,
+                                     file_png = file.path(plot_dir, "KEGG_all_union_network.png"),
+                                     family = BASE_FONT,
+                                     fontsize = 12,
+                                     label_scale = 5.5,         # 라벨 크게
+                                     edge_topk = 3,             # 노드당 유지할 최대 엣지 수
+                                     save = FALSE){
+  
+  if (!inherits(net, "list") || is.null(net$g) ||
+      igraph::gorder(net$g) == 0 || igraph::gsize(net$g) == 0) {
+    message("노드/엣지 부족 → 스킵: ", file_png); return(invisible(NULL))
+  }
+  
+  # 4-1) 엣지 슬리밍
+  g <- prune_edges_topk(net$g, k = edge_topk)
+  
+  # 4-2) 속성 준비
+  nlogp <- igraph::V(g)$neglog10p_max
+  tcnt  <- igraph::V(g)$tag_count
+  lab   <- igraph::V(g)$label
+  act_cat <- dplyr::case_when(tcnt >= 3 ~ "3 contrasts",
+                              tcnt == 2 ~ "2 contrasts",
+                              TRUE      ~ "1 contrast")
+  lab_wrap <- stringr::str_wrap(lab, 38)
+  
+  g <- igraph::set_vertex_attr(g, "neglog10p_c", value = pmin(nlogp, node_cap))
+  g <- igraph::set_vertex_attr(g, "act_cat",     value = act_cat)
+  g <- igraph::set_vertex_attr(g, "label_wrap",  value = lab_wrap)
+  
+  # 4-3) 레이아웃(넓은 공간, 충돌 최소화)
+  coords <- compute_tight_layout(g, seed = seed, area_scale = 2.5, iter = 6000)
+  
+  # 4-4) 그리기
+  edge_width_fixed <- 0.8
+  p <- ggraph::ggraph(g, layout = "manual", x = coords$x, y = coords$y) +
+    # 엣지: 얇고 투명도 크게 떨어뜨림
+    ggraph::geom_edge_link(aes(alpha = jaccard),
+                           colour = "black", linewidth = edge_width_fixed, lineend = "round") +
+    ggraph::scale_edge_alpha(name = "Jaccard", limits = c(0,1),
+                             range = c(0.05,0.65),
+                             breaks = c(0.25,0.50,0.75,1.00),
+                             labels = c("0.25","0.50","0.75","1.00")) +
+    # 노드
+    ggraph::geom_node_point(aes(size = neglog10p_c, fill = act_cat),
+                            shape = 21, colour = "grey10", stroke = 0.9) +
+    ggplot2::scale_size_continuous(name = "max -log10(p)", range = c(7, 26),
+                                   limits = c(0, node_cap)) +
+    ggplot2::scale_fill_manual(
+      name = "Activated in…",
+      values = c("1 contrast" = "black",
+                 "2 contrasts" = "#7B1FA2",
+                 "3 contrasts" = "#FFC107")
+    ) +
+    # 라벨: 박스+리더라인, 강한 repel, 넉넉한 패딩
+    ggraph::geom_node_label(aes(label = label_wrap),
+                            repel = TRUE,
+                            family = family,
+                            size = (fontsize/3.1) * label_scale,
+                            label.size = 0.25,
+                            label.padding = unit(0.28, "lines"),
+                            label.r = unit(0.2, "lines"),
+                            fill = "white",
+                            colour = "black",
+                            segment.colour = "grey15",
+                            segment.size = 0.5,
+                            segment.alpha = .85,
+                            force = 2.5,           # ← 밀어내는 힘
+                            max.overlaps = Inf,
+                            box.padding   = 0.9,
+                            point.padding = 0.8) +
+    ggplot2::labs(title = title) +
+    ggplot2::theme_void(base_family = family) +
+    ggplot2::theme(
+      plot.title      = ggplot2::element_text(size = (fontsize + 6) * 2.2, face = "bold"),
+      legend.title    = ggplot2::element_text(size = (fontsize)      * 2.0, face = "bold"),
+      legend.text     = ggplot2::element_text(size = (fontsize - 2)  * 1.8),
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      panel.background= ggplot2::element_rect(fill = "white", colour = NA),
+      legend.background=ggplot2::element_rect(fill = "white", colour = NA),
+      plot.margin     = margin(20, 20, 20, 20)
+    )
+  
+  # 화면 출력 + (옵션) 저장
+  print(p)
+  if (isTRUE(save)) {
+    ggplot2::ggsave(file_png, p, width = width, height = height, dpi = dpi)
+    message("저장: ", normalizePath(file_png))
+  }
+  invisible(p)
+}
+
+# ---------------- 실행 예 ----------------
+net_all <- build_global_term_network(
+  enr_labeled,
+  source_filter = "KEGG",
+  min_overlap = 3,       # 필요시 4~5로 올리면 더 듬성듬성
+  jaccard_cut = 0.2      # 0.2~0.3 권장; 너무 촘촘하면 ↑
+)
+
+plot_global_term_network(
+  net_all,
+  title     = "KEGG term network — all contrasts (edge α = Jaccard)",
+  node_cap  = 6,
+  family    = BASE_FONT,
+  label_scale = 6.0,     # 라벨 더 크게 원하면 7~8
+  edge_topk   = 3,       # 노드당 최대 3개의 엣지만 유지
+  save = FALSE           # 화면 출력; 저장 원하면 TRUE
+)
+
+
+---
+title: "BMDMs + TNF alpha Stemness gProfiler Anaylsis Part"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+############################################################
+# 0. Input 설정
+############################################################
+in_file  <- "Control_vs_tnfa_1K_5K_log2FC_ttest_rawP_FDR.csv"
+organism <- "mmusculus"                 # 사람 데이터면 "hsapiens"
+sources  <- c("GO:BP", "KEGG")         # 필요시 "GO:MF","REAC","WP" 등 추가
+
+############################################################
+# 1. 패키지 (필요시 자동 설치)
+############################################################
+req  <- c("readr","dplyr","stringr","purrr","tidyr","ggplot2","gprofiler2")
+inst <- rownames(installed.packages())
+if (length(setdiff(req, inst)) > 0) {
+  install.packages(setdiff(req, inst), repos = "https://cloud.r-project.org")
+}
+suppressPackageStartupMessages({
+  library(readr);   library(dplyr);    library(stringr)
+  library(purrr);   library(tidyr);    library(ggplot2)
+  library(gprofiler2)
+})
+
+# dplyr/tidyr 네임스페이스 단축 (선택)
+select       <- dplyr::select
+filter       <- dplyr::filter
+mutate       <- dplyr::mutate
+arrange      <- dplyr::arrange
+group_by     <- dplyr::group_by
+ungroup      <- dplyr::ungroup
+pivot_longer <- tidyr::pivot_longer
+pivot_wider  <- tidyr::pivot_wider
+
+############################################################
+# 2. 데이터 읽기 및 유효성 점검
+#    (필수 컬럼: .endpoint, contrast, log2FC, p_adj)
+############################################################
+dat <- readr::read_csv(in_file, show_col_types = FALSE)
+
+need    <- c(".endpoint","contrast","log2FC","p_adj")
+missing <- setdiff(need, names(dat))
+if (length(missing) > 0) {
+  stop("입력 CSV에 다음 컬럼이 없습니다: ", paste(missing, collapse=", "))
+}
+
+############################################################
+# 3. 대비별 Up-gene 리스트 작성
+#    1순위: padj < 0.05 & log2FC > 0 (≥3개)
+#    2순위: padj < 0.10 & log2FC > 0 (≥3개)
+#    3순위: Up-gene 상위 200개 (padj 기준 정렬)
+############################################################
+lists <- dat %>%
+  filter(!is.na(p_adj), !is.na(log2FC)) %>%
+  group_by(contrast) %>%
+  group_modify(~{
+    df <- .x
+    
+    # Up-gene 전체
+    up_all <- df %>%
+      filter(log2FC > 0) %>%
+      mutate(
+        gene = .endpoint %>% as.character() %>% stringr::str_trim()
+      )
+    
+    # (1) padj < 0.05
+    up_005 <- up_all %>% filter(p_adj < 0.05)
+    if (nrow(up_005) >= 3) {
+      genes_use <- unique(up_005$gene)
+      tibble(
+        genes     = list(genes_use),
+        n_up_sig  = length(genes_use),
+        crit_used = "padj < 0.05"
+      )
+    } else {
+      # (2) padj < 0.10
+      up_010 <- up_all %>% filter(p_adj < 0.10)
+      if (nrow(up_010) >= 3) {
+        genes_use <- unique(up_010$gene)
+        tibble(
+          genes     = list(genes_use),
+          n_up_sig  = length(genes_use),
+          crit_used = "padj < 0.10"
+        )
+      } else {
+        # (3) fallback: Up-gene 상위 200개 (padj 기준)
+        up_top <- up_all %>%
+          arrange(p_adj) %>%
+          slice_head(n = 200)
+        genes_use <- unique(up_top$gene)
+        tibble(
+          genes     = list(genes_use),
+          n_up_sig  = length(genes_use),
+          crit_used = "top200_up_by_padj"
+        )
+      }
+    }
+  }) %>%
+  ungroup()
+
+message("대비별 Up-gene 선택 요약:")
+print(lists %>% select(contrast, n_up_sig, crit_used))
+
+############################################################
+# 4. 결과 폴더 생성 + gene list 파일 저장
+############################################################
+dir.create("gprofiler_inputs",  showWarnings = FALSE)
+dir.create("gprofiler_results", showWarnings = FALSE)
+dir.create("gprofiler_plots",   showWarnings = FALSE)
+
+index <- lists %>%
+  mutate(
+    safe = gsub("[^A-Za-z0-9_\\-]+", "_", contrast),
+    file = file.path("gprofiler_inputs",
+                     paste0(safe, "__UP_selected_for_gprofiler.txt"))
+  )
+
+purrr::walk2(index$file, lists$genes, ~{
+  writeLines(.y, .x, useBytes = TRUE)
+})
+
+readr::write_csv(
+  index %>% select(file, contrast, n_up_sig, crit_used),
+  file.path("gprofiler_inputs", "INDEX_selected_UP_lists.csv")
+)
+
+############################################################
+# 5. g:Profiler (GO:BP, KEGG) — 대비별 실행
+############################################################
+run_one <- function(genes, tag) {
+  genes <- genes[!is.na(genes) & nzchar(genes)]
+  genes <- unique(genes)
+  if (length(genes) < 3) {
+    message(sprintf("[SKIP] %s — gene count < 3", tag))
+    return(NULL)
+  }
+  message(sprintf("[g:Profiler] %s (n=%d)", tag, length(genes)))
+  gp <- gprofiler2::gost(
+    query              = genes,
+    organism           = organism,
+    sources            = sources,
+    correction_method  = "g_SCS",
+    user_threshold     = 0.05,
+    evcodes            = TRUE
+  )
+  if (is.null(gp) || is.null(gp$result)) return(NULL)
+  out <- gp$result %>%
+    arrange(p_value) %>%
+    mutate(tag = tag)
+  out
+}
+
+enr_list <- purrr::map2(lists$genes, lists$contrast, run_one)
+
+enr <- dplyr::bind_rows(enr_list)
+
+if (!is.null(enr) && nrow(enr) > 0) {
+  readr::write_csv(
+    enr,
+    file.path("gprofiler_results", "GO_BP_KEGG_enrichment_all_contrasts.csv")
+  )
+  message("저장: gprofiler_results/GO_BP_KEGG_enrichment_all_contrasts.csv")
+} else {
+  message("유효한 enrichment 결과가 없습니다.")
+}
+
+############################################################
+# 6. Bubble Plot (대비별 × source별 상위 20 term)
+#    x: -log10(p_value), y: term_name
+#    size: intersection_size/term_size, color: -log10(p)
+############################################################
+make_bubble_by_source <- function(df_contrast, contrast) {
+  if (is.null(df_contrast) || nrow(df_contrast) == 0) return(invisible(NULL))
+  
+  srcs <- sort(unique(df_contrast$source))
+  for (src in srcs) {
+    dsub <- df_contrast %>% dplyr::filter(source == src)
+    if (nrow(dsub) == 0) next
+    
+    dfp <- dsub %>%
+      dplyr::mutate(
+        neglog10p  = -log10(p_value + 1e-300),
+        gene_ratio = ifelse(term_size > 0,
+                            intersection_size/term_size,
+                            NA_real_)
+      ) %>%
+      dplyr::arrange(dplyr::desc(neglog10p)) %>%
+      dplyr::slice_head(n = 20)
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(x = neglog10p, y = reorder(term_name, neglog10p))
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = gene_ratio, color = neglog10p),
+        alpha = 0.85
+      ) +
+      ggplot2::scale_size_continuous(name = "Gene ratio", limits = c(0, 1)) +
+      ggplot2::scale_color_gradient(
+        name = "-log10(p)",
+        low  = "grey70",
+        high = "red"
+      ) +
+      ggplot2::labs(
+        title   = paste0(src, " enrichment — ", contrast, " (UP gene set)"),
+        x       = "-log10(p-value)",
+        y       = NULL,
+        caption = "g:Profiler (g_SCS)"
+      ) +
+      ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(
+        axis.text.y = ggplot2::element_text(size = 10),
+        plot.title  = ggplot2::element_text(face = "bold", size = 13)
+      )
+    
+    fn <- file.path(
+      "gprofiler_plots",
+      paste0(
+        gsub("[^A-Za-z0-9_\\-]+", "_", contrast), "_",
+        gsub(":", "_", src),
+        "_bubble.png"
+      )
+    )
+    ggplot2::ggsave(fn, p, width = 8, height = 6, dpi = 300)
+    message(sprintf("저장: %s", fn))
+  }
+}
+
+if (!is.null(enr) && nrow(enr) > 0) {
+  enr %>%
+    split(.$tag) %>%
+    purrr::imap(~ make_bubble_by_source(.x, .y))
+}
+
+message("=== gProfiler + Bubble plot 전체 완료 ===")
+
+
+---
+title: "BMDMs + TNF alpha Stemness gProfiler Process"
+author: "TaeBaek Lee"
+date: "2025-12-11"
+output: html_document
+---
+
+# ======================================================
+# 0) 패키지 / 라벨 테이블
+# ======================================================
+suppressPackageStartupMessages({
+  library(tibble); library(readr); library(readxl)
+  library(dplyr);  library(stringr); library(purrr)
+  library(tidyr);  library(ggplot2); library(grid)
+})
+
+
+# ======================================================
+# 1) 입력/출력 설정
+#    - 현재 working directory 에 세 개의 gProfiler 엑셀 파일이 있다고 가정
+# ======================================================
+file_tag <- c(
+  "Only TNF"       = "gProfiler_ Only TNF-1.xlsx",
+  "TNF + BMDMs 5K" = "gProfiler_ Only TNF-1+BMDMs 5K.xlsx",
+  "TNF + BMDMs 1K" = "gProfiler_ Only TNF+BMDMS1K.xlsx"
+)
+
+missing_files <- file_tag[!file.exists(unname(file_tag))]
+if (length(missing_files) > 0) {
+  stop("다음 파일을 찾을 수 없습니다: ",
+       paste(missing_files, collapse = ", "))
+}
+
+out_csv  <- "gprofiler_results/enrichment_with_labels_TNF_BMDMs.csv"
+plot_dir <- "gprofiler_plots_TNF_BMDMs"
+dir.create(dirname(out_csv), showWarnings = FALSE, recursive = TRUE)
+dir.create(plot_dir,          showWarnings = FALSE, recursive = TRUE)
+
+# ======================================================
+# 2) 각 엑셀 파일(1번 시트)을 읽어서 하나의 enr 테이블로 결합
+# ======================================================
+enr_list <- purrr::imap(file_tag, function(path, tag) {
+  df <- readxl::read_excel(path, sheet = 1)
+  # 열 이름 공백 정리
+  names(df) <- names(df) %>% stringr::str_squish()
+  # tag 컬럼 없으면 추가
+  if (!"tag" %in% names(df)) df$tag <- tag
+  df
+})
+
+enr <- dplyr::bind_rows(enr_list)
+
+# 필요하면 KEGG만 보고 싶으면 아래 필터 사용
+# enr <- dplyr::filter(enr, source == "KEGG")
+
+# 필수 기본 컬럼 확인 (p-value 관련은 따로 처리)
+required_cols_base <- c("tag","source","term_id","term_name",
+                        "term_size","intersection_size")
+miss_base <- setdiff(required_cols_base, names(enr))
+if (length(miss_base) > 0) {
+  stop("입력 gProfiler 엑셀에 다음 컬럼이 없습니다: ",
+       paste(miss_base, collapse = ", "))
+}
+
+# p-value 정보 컬럼 존재 여부 확인
+has_p_raw   <- "p_value" %in% names(enr)
+has_p_adj   <- "adjusted_p_value" %in% names(enr)
+has_neglog  <- "negative_log10_of_adjusted_p_value" %in% names(enr)
+
+if (!has_p_raw && !has_p_adj && !has_neglog) {
+  stop("p-value 정보를 찾을 수 없습니다: p_value / adjusted_p_value / negative_log10_of_adjusted_p_value 중 하나가 필요합니다.")
+}
+
+# ======================================================
+# 3) 라벨 적용 (대/소문자/공백 정규화 후 조인)
+# ======================================================
+norm_key <- function(x) stringr::str_squish(stringr::str_to_lower(x))
+
+enr_key <- enr %>%
+  dplyr::mutate(
+    source_key = norm_key(source),
+    term_key   = norm_key(term_name)
+  )
+
+map_key <- rename_pairs %>%
+  dplyr::mutate(
+    source_key = norm_key(source),
+    term_key   = norm_key(term_name)
+  ) %>%
+  dplyr::select(source_key, term_key, new_label)
+
+enr_labeled <- enr_key %>%
+  dplyr::left_join(map_key, by = c("source_key","term_key")) %>%
+  dplyr::mutate(label = dplyr::coalesce(new_label, term_name)) %>%
+  dplyr::select(-source_key, -term_key)
+
+# ======================================================
+# 4) 플롯 제외 항목 제거(원명/라벨 모두 기준, 정규화)
+# ======================================================
+drop_key <- norm_key(drop_terms)
+
+enr_labeled <- enr_labeled %>%
+  dplyr::mutate(
+    term_key  = norm_key(term_name),
+    label_key = norm_key(label)
+  ) %>%
+  dplyr::filter(
+    !(term_key  %in% drop_key),
+    !(label_key %in% drop_key)
+  ) %>%
+  dplyr::select(-term_key, -label_key)
+
+readr::write_csv(enr_labeled, out_csv)
+message("라벨 적용 + 삭제 반영 완료: ", out_csv)
+
+# ======================================================
+# 5) 플롯 전처리
+#    - gProfiler 엑셀의 adjusted_p_value / negative_log10_of_adjusted_p_value 를 사용
+# ======================================================
+prep_for_plot <- function(df, top_n = 20, wrap_width = 40) {
+  
+  # p-value 선택 (있으면 기록용으로만 사용)
+  p_col <- rep(NA_real_, nrow(df))
+  if ("p_value" %in% names(df)) {
+    p_col <- suppressWarnings(as.numeric(df$p_value))
+  } else if ("adjusted_p_value" %in% names(df)) {
+    p_col <- suppressWarnings(as.numeric(df$adjusted_p_value))
+  }
+  
+  # -log10(p) 선택
+  if ("negative_log10_of_adjusted_p_value" %in% names(df)) {
+    neglog10p <- suppressWarnings(as.numeric(df$negative_log10_of_adjusted_p_value))
+  } else if (all(!is.na(p_col))) {
+    neglog10p <- -log10(p_col + 1e-300)
+  } else {
+    stop("prep_for_plot: p-value 정보를 찾을 수 없습니다.")
+  }
+  
+  df %>%
+    dplyr::mutate(
+      term_size         = suppressWarnings(as.numeric(term_size)),
+      intersection_size = suppressWarnings(as.numeric(intersection_size)),
+      p_value           = p_col,
+      neglog10p         = neglog10p,
+      overlap_n         = as.integer(intersection_size),
+      overlap_bin = dplyr::case_when(
+        is.na(overlap_n) ~ NA_integer_,
+        overlap_n <= 1   ~ 1L,
+        overlap_n == 2   ~ 2L,
+        overlap_n == 3   ~ 3L,
+        overlap_n == 4   ~ 4L,
+        overlap_n >= 5   ~ 5L
+      ),
+      overlap_lab = factor(
+        overlap_bin,
+        levels = 1:5,
+        labels = c("1","2","3","4","≥5")
+      ),
+      plot_label = stringr::str_wrap(label, width = wrap_width)
+    ) %>%
+    dplyr::arrange(dplyr::desc(neglog10p)) %>%
+    dplyr::slice_head(n = top_n)
+}
+
+# ======================================================
+# 6) Bubble plot
+# ======================================================
+make_bubble_by_source <- function(df_contrast, contrast,
+                                  top_n = 20, x_upper = 6) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    
+    dfp <- prep_for_plot(dsub, top_n)
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(
+        x = neglog10p,
+        y = reorder(plot_label, neglog10p)
+      )
+    ) +
+      ggplot2::geom_point(
+        ggplot2::aes(size = overlap_lab, color = neglog10p),
+        alpha = 0.9
+      ) +
+      ggplot2::scale_size_manual(
+        name   = "Overlap (genes)",
+        values = c(4, 9, 14, 18, 24),
+        breaks = c("1","2","3","4","≥5"),
+        labels = c("1","2","3","4","≥5"),
+        guide  = ggplot2::guide_legend(
+          override.aes = list(alpha = 0.9)
+        )
+      ) +
+      ggplot2::scale_color_gradient(
+        name   = "-log10(p)",
+        low    = "#7E57C2",
+        high   = "#F2C94C",
+        limits = c(0, x_upper)
+      ) +
+      ggplot2::scale_x_continuous(
+        limits = c(0, x_upper),
+        breaks = seq(0, floor(x_upper), by = 1),
+        expand = ggplot2::expansion(mult = c(0, 0.02))
+      ) +
+      ggplot2::guides(
+        color = ggplot2::guide_colorbar(
+          direction      = "vertical",
+          barheight      = grid::unit(12, "cm"),
+          barwidth       = grid::unit(0.8, "cm"),
+          ticks          = TRUE,
+          title.position = "top"
+        ),
+        size = ggplot2::guide_legend(
+          override.aes = list(alpha = 0.9)
+        )
+      ) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ",
+                       contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)",
+        y = NULL
+      ) +
+      ggplot2::theme_minimal(
+        base_size   = 20,
+        base_family = "Times New Roman"
+      ) +
+      ggplot2::theme(
+        legend.position = "right",
+        legend.box      = "vertical",
+        text         = ggplot2::element_text(
+          family = "Times New Roman"
+        ),
+        axis.text.y  = ggplot2::element_text(
+          size = 24, face = "bold"
+        ),
+        axis.text.x  = ggplot2::element_text(
+          size = 24, face = "bold"
+        ),
+        axis.title.x = ggplot2::element_text(
+          size   = 22,
+          face   = "bold",
+          margin = ggplot2::margin(t = 12)
+        ),
+        plot.title   = ggplot2::element_text(
+          size   = 24,
+          face   = "bold",
+          margin = ggplot2::margin(b = 12)
+        ),
+        legend.title = ggplot2::element_text(size = 30),
+        legend.text  = ggplot2::element_text(size = 24)
+      )
+    
+    fn <- file.path(
+      plot_dir,
+      paste0(
+        gsub("[^A-Za-z0-9_\\-]+", "_", contrast),
+        "_",
+        gsub(":", "_", src),
+        "_bubble.png"
+      )
+    )
+    
+    ggplot2::ggsave(fn, p, width = 15, height = 10, dpi = 600)
+    message(sprintf(
+      "저장: %s (x_upper=%.2f; overlap bins: %s)",
+      fn, x_upper, paste(levels(dfp$overlap_lab), collapse=", ")
+    ))
+  }
+}
+
+# ======================================================
+# 7) Horizontal bar plot (옵션)
+# ======================================================
+make_bar_by_source <- function(df_contrast, contrast, top_n = 20) {
+  if (nrow(df_contrast) == 0) return(invisible(NULL))
+  
+  for (src in sort(unique(df_contrast$source))) {
+    dsub <- dplyr::filter(df_contrast, source == src)
+    if (nrow(dsub) == 0) next
+    
+    dfp <- prep_for_plot(dsub, top_n)
+    
+    p <- ggplot2::ggplot(
+      dfp,
+      ggplot2::aes(
+        y = reorder(plot_label, neglog10p),
+        x = neglog10p
+      )
+    ) +
+      ggplot2::geom_col(width = 0.65) +
+      ggplot2::geom_text(
+        ggplot2::aes(label = sprintf("%.2f", neglog10p)),
+        hjust = -0.1,
+        size  = 4
+      ) +
+      ggplot2::scale_x_continuous(
+        expand = ggplot2::expansion(mult = c(0, 0.08))
+      ) +
+      ggplot2::labs(
+        title = paste0(src, " enrichment — ",
+                       contrast, " (UP padj<0.05)"),
+        x = "-log10(p-value)",
+        y = NULL
+      ) +
+      ggplot2::theme_minimal(base_size = 14) +
+      ggplot2::theme(
+        axis.text.y = ggplot2::element_text(size = 12),
+        plot.title  = ggplot2::element_text(
+          face = "bold", size = 14
+        )
+      )
+    
+    fn <- file.path(
+      plot_dir,
+      paste0(
+        gsub("[^A-Za-z0-9_\\-]+", "_", contrast),
+        "_",
+        gsub(":", "_", src),
+        "_bar.png"
+      )
+    )
+    
+    ggplot2::ggsave(fn, p, width = 9, height = 6.5, dpi = 300)
+    message("저장: ", fn)
+  }
+}
+
+# ======================================================
+# 8) 대비(tag) × source 별 그림 생성
+# ======================================================
+enr_labeled %>%
+  split(.$tag) %>%
+  purrr::imap(~ {
+    make_bubble_by_source(.x, .y, top_n = 20, x_upper = 6)
+    make_bar_by_source(   .x, .y, top_n = 20)
+  })
+
+message("완료: PNGs -> ", normalizePath(plot_dir))
